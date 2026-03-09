@@ -1,0 +1,19 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Ignore .pyc files specifically (already covered above, but explicit is okay)
+*.pyc
+
+# Local development files (optional, depending on your setup)
+
+.local/
+*.log
+.DS_Store
+Thumbs.db
+local_report.db
+# IDE / Editor files (optional)
+.idea/
+*.swp
+*.swo

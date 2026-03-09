@@ -1,0 +1,467 @@
+{% macro render_rows(rows) -%}
+    {% if rows %}
+        {% for r in rows %}
+            <tr>
+                <td>
+                    {{ r.agent_id }}
+                    <div class="small">{{ r.event }}</div>
+                </td>
+                <td>{{ r.region or "-" }}</td>
+                <td>{{ r.current_group }}</td>
+                <td>{{ r.role_index }}</td>
+                <td>
+                    {{ r.server_time }}
+                    {% if r.client_ts %}
+                        <div class="small">client: {{ r.client_ts }}</div>
+                    {% endif %}
+                </td>
+                <td>{{ r.elapsed }}</td>
+                <td>
+                    {% if r.stale %}
+                        <span class="warn">超时</span>
+                    {% else %}
+                        <span class="ok">正常</span>
+                    {% endif %}
+                </td>
+                <td>
+                    <button class="btn" onclick='removeAgent({{ r.agent_id|tojson }})'>删除</button>
+                </td>
+            </tr>
+        {% endfor %}
+    {% else %}
+        <tr>
+            <td colspan="8" class="empty">暂无上报数据</td>
+        </tr>
+    {% endif %}
+{%- endmacro %}
+<!doctype html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>{{ app_name }}</title>
+    <style>
+        :root {
+            --bg: #f4f6fb;
+            --card: #ffffff;
+            --line: #dbe2ea;
+            --line-strong: #c7d0db;
+            --text: #17202b;
+            --muted: #607083;
+            --ok: #15803d;
+            --warn: #dc2626;
+            --accent: #165dff;
+            --accent-soft: #eff5ff;
+            --shadow: 0 10px 30px rgba(23, 32, 43, 0.06);
+        }
+
+        * {
+            box-sizing: border-box;
+        }
+
+        body {
+            margin: 0;
+            background:
+                radial-gradient(circle at top left, rgba(22, 93, 255, 0.08), transparent 24%),
+                linear-gradient(180deg, #f7f9fc 0%, #eef3f9 100%);
+            color: var(--text);
+            font-family: "Segoe UI", "PingFang SC", "Microsoft YaHei", Arial, sans-serif;
+        }
+
+        .container {
+            max-width: 1280px;
+            margin: 20px auto;
+            padding: 0 14px 24px;
+        }
+
+        .card {
+            background: var(--card);
+            border: 1px solid var(--line);
+            border-radius: 16px;
+            padding: 16px;
+            margin-bottom: 16px;
+            box-shadow: var(--shadow);
+        }
+
+        .hero {
+            padding: 20px;
+        }
+
+        h1 {
+            margin: 0 0 10px 0;
+            font-size: 34px;
+            line-height: 1.05;
+        }
+
+        h2 {
+            margin: 0;
+            font-size: 22px;
+        }
+
+        .meta {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 12px;
+            color: var(--muted);
+            font-size: 14px;
+        }
+
+        .meta span {
+            background: #f8fafc;
+            border: 1px solid var(--line);
+            border-radius: 999px;
+            padding: 6px 12px;
+        }
+
+        .toolbar {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 12px;
+            margin-bottom: 12px;
+            flex-wrap: wrap;
+        }
+
+        .toolbar-left {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            flex-wrap: wrap;
+        }
+
+        .hint {
+            color: var(--muted);
+            font-size: 13px;
+        }
+
+        .btn {
+            border: 1px solid var(--line-strong);
+            background: #ffffff;
+            color: var(--text);
+            border-radius: 10px;
+            padding: 6px 12px;
+            cursor: pointer;
+            font-size: 14px;
+        }
+
+        .btn:hover {
+            opacity: 0.88;
+        }
+
+        .btn-danger {
+            border-color: #ef4444;
+            color: #b91c1c;
+        }
+
+        .summary {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 10px;
+        }
+
+        .badge {
+            border-radius: 999px;
+            padding: 4px 10px;
+            font-size: 12px;
+            font-weight: 600;
+            border: 1px solid var(--line);
+            background: #ffffff;
+            color: var(--muted);
+        }
+
+        .badge-accent {
+            background: var(--accent-soft);
+            border-color: #d5e3ff;
+            color: var(--accent);
+        }
+
+        .badge-warn {
+            background: #fff2f2;
+            border-color: #fecaca;
+            color: var(--warn);
+        }
+
+        .region-section {
+            border: 1px solid var(--line);
+            border-radius: 14px;
+            overflow: hidden;
+            margin-top: 14px;
+            background: #fbfdff;
+        }
+
+        .region-head {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 12px;
+            padding: 14px 16px;
+            background: linear-gradient(180deg, #f8fbff 0%, #f1f6ff 100%);
+            border-bottom: 1px solid var(--line);
+        }
+
+        .region-subtitle {
+            margin-top: 4px;
+            color: var(--muted);
+            font-size: 13px;
+        }
+
+        table {
+            width: 100%;
+            border-collapse: collapse;
+        }
+
+        th {
+            text-align: left;
+            font-size: 13px;
+            letter-spacing: 0.02em;
+            color: var(--muted);
+            border-bottom: 1px solid var(--line);
+            padding: 10px 8px;
+            background: #ffffff;
+        }
+
+        td {
+            font-size: 14px;
+            border-bottom: 1px solid var(--line);
+            padding: 10px 8px;
+            vertical-align: top;
+            background: #ffffff;
+        }
+
+        tr:last-child td {
+            border-bottom: none;
+        }
+
+        .small {
+            color: var(--muted);
+            font-size: 12px;
+        }
+
+        .ok {
+            color: var(--ok);
+            font-weight: 600;
+        }
+
+        .warn {
+            color: var(--warn);
+            font-weight: 600;
+        }
+
+        .empty {
+            color: var(--muted);
+            font-size: 13px;
+            text-align: center;
+            padding: 24px 10px;
+        }
+
+        .region-card-title {
+            margin: 0 0 10px 0;
+            font-size: 20px;
+        }
+
+        .chip {
+            display: inline-block;
+            border: 1px solid var(--line);
+            border-radius: 999px;
+            padding: 4px 10px;
+            margin: 4px 6px 0 0;
+            font-size: 12px;
+            color: var(--muted);
+            background: #ffffff;
+        }
+
+        .footer {
+            margin-top: 10px;
+            color: var(--muted);
+            font-size: 12px;
+        }
+
+        @media (max-width: 900px) {
+            .container {
+                margin-top: 14px;
+                padding: 0 10px 18px;
+            }
+
+            h1 {
+                font-size: 26px;
+            }
+
+            h2 {
+                font-size: 18px;
+            }
+
+            .meta,
+            .summary,
+            .toolbar,
+            .toolbar-left,
+            .region-head {
+                gap: 8px;
+            }
+
+            th,
+            td {
+                font-size: 13px;
+                padding: 8px 6px;
+            }
+        }
+    </style>
+</head>
+<body>
+<div class="container">
+    <div class="card hero">
+        <h1>{{ app_name }}</h1>
+        <div class="meta">
+            <span>超时阈值：{{ timeout }} 秒</span>
+            <span>自动刷新：{{ ui_auto_refresh_seconds }} 秒</span>
+            <span>布局模式：{% if ui_layout_mode == "grouped" %}按区服分组{% else %}普通列表{% endif %}</span>
+            <span>时间：<span id="now">-</span></span>
+        </div>
+    </div>
+
+    <div class="card">
+        <div class="toolbar">
+            <div class="toolbar-left">
+                <button class="btn btn-danger" onclick="clearAllAgents()">清空当前页面 Agent</button>
+                <span class="hint">页面展示由 .env 中的 UI_LAYOUT_MODE 和 UI_AUTO_REFRESH_SECONDS 控制</span>
+            </div>
+            <div class="summary">
+                <span class="badge badge-accent">当前 Agent：{{ rows | length }}</span>
+                {% if ui_layout_mode == "grouped" %}
+                    <span class="badge">区服分组：{{ region_groups | length }}</span>
+                {% endif %}
+            </div>
+        </div>
+
+        {% if ui_layout_mode == "grouped" %}
+            {% if region_groups %}
+                {% for group in region_groups %}
+                    <section class="region-section">
+                        <div class="region-head">
+                            <div>
+                                <h2>{{ group.region }}</h2>
+                                <div class="region-subtitle">按区服聚合显示，便于连续查看和排查</div>
+                            </div>
+                            <div class="summary">
+                                <span class="badge badge-accent">Agent {{ group.count }}</span>
+                                {% if group.stale_count %}
+                                    <span class="badge badge-warn">超时 {{ group.stale_count }}</span>
+                                {% else %}
+                                    <span class="badge">全部正常</span>
+                                {% endif %}
+                            </div>
+                        </div>
+                        <table>
+                            <thead>
+                            <tr>
+                                <th>Agent</th>
+                                <th>区服</th>
+                                <th>当前执行组</th>
+                                <th>当前上报角色</th>
+                                <th>最后上报时间</th>
+                                <th>距今秒数</th>
+                                <th>状态</th>
+                                <th>操作</th>
+                            </tr>
+                            </thead>
+                            <tbody>
+                            {{ render_rows(group.rows) }}
+                            </tbody>
+                        </table>
+                    </section>
+                {% endfor %}
+            {% else %}
+                <table>
+                    <tbody>
+                    {{ render_rows([]) }}
+                    </tbody>
+                </table>
+            {% endif %}
+        {% else %}
+            <table>
+                <thead>
+                <tr>
+                    <th>Agent</th>
+                    <th>区服</th>
+                    <th>当前执行组</th>
+                    <th>当前上报角色</th>
+                    <th>最后上报时间</th>
+                    <th>距今秒数</th>
+                    <th>状态</th>
+                    <th>操作</th>
+                </tr>
+                </thead>
+                <tbody>
+                {{ render_rows(rows) }}
+                </tbody>
+            </table>
+        {% endif %}
+
+        <div class="footer">企业微信机器人支持 ALERT_WEBHOOK_URL 和 ALERT_WEBHOOK_URLS 两种配置方式。</div>
+    </div>
+
+    {% if region_stats and region_stats.enabled %}
+    <div class="card">
+        <h2 class="region-card-title">区服完成统计</h2>
+        <div class="meta">
+            <span>总区服数：{{ region_stats.max_regions }}</span>
+            <span>已完成：{{ region_stats.completed_count }}</span>
+            <span>未完成：{{ region_stats.missing_regions | length }}</span>
+        </div>
+        <div style="margin-top: 10px;">
+            {% if region_stats.missing_regions %}
+                {% for region in region_stats.missing_regions %}
+                    <span class="chip">{{ region }}</span>
+                {% endfor %}
+            {% else %}
+                <span class="ok">全部区服已完成</span>
+            {% endif %}
+        </div>
+    </div>
+    {% endif %}
+</div>
+
+<script>
+    function buildApiUrl(path) {
+        const url = new URL(path, window.location.origin);
+        const authToken = new URLSearchParams(window.location.search).get('auth_token');
+        if (authToken) {
+            url.searchParams.set('auth_token', authToken);
+        }
+        return url.toString();
+    }
+
+    async function removeAgent(agentId) {
+        if (!agentId) return;
+        if (!confirm(`确认删除 ${agentId} 吗？`)) return;
+        const resp = await fetch(buildApiUrl('/api/agent/remove'), {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ agent_id: agentId })
+        });
+        if (!resp.ok) {
+            alert('删除失败，请检查鉴权或服务日志');
+            return;
+        }
+        location.reload();
+    }
+
+    async function clearAllAgents() {
+        if (!confirm('确认清空当前页面所有 Agent 吗？')) return;
+        const resp = await fetch(buildApiUrl('/api/agents/clear'), { method: 'POST' });
+        if (!resp.ok) {
+            alert('清空失败，请检查鉴权或服务日志');
+            return;
+        }
+        location.reload();
+    }
+
+    function tick() {
+        document.getElementById('now').textContent = new Date().toLocaleString();
+    }
+
+    tick();
+    setInterval(tick, 1000);
+    setTimeout(() => location.reload(), {{ ui_auto_refresh_seconds * 1000 }});
+</script>
+</body>
+</html>
