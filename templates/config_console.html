@@ -158,6 +158,7 @@
 
         input[type="text"],
         input[type="number"],
+        select,
         textarea {
             width: 100%;
             border: 1px solid var(--line-strong);
@@ -316,6 +317,8 @@
 
             <form method="post" action="/console/agents/save{{ auth_query_suffix }}">
                 <input type="hidden" name="original_agent_id" value="{{ selected_agent.agent_id }}" />
+                <input type="hidden" name="desired_action" value="{{ selected_agent.desired_action }}" />
+                <input type="hidden" name="action_seq" value="{{ selected_agent.action_seq }}" />
                 <div class="field-grid">
                     <div class="field">
                         <label>Agent ID</label>
@@ -367,6 +370,43 @@
                             <div class="field">
                                 <label>优先级</label>
                                 <input type="number" name="priority" value="{{ selected_agent.priority }}" />
+                            </div>
+                        </div>
+
+                        <div class="field-row">
+                            <div class="field">
+                                <label>期望运行状态</label>
+                                <select name="desired_run_state">
+                                    <option value="run" {% if selected_agent.desired_run_state == "run" %}selected{% endif %}>run</option>
+                                    <option value="stop" {% if selected_agent.desired_run_state == "stop" %}selected{% endif %}>stop</option>
+                                </select>
+                            </div>
+                            <div class="field">
+                                <label>每日启动时间</label>
+                                <input type="text" name="schedule_daily_start" value="{{ selected_agent.schedule_daily_start }}" placeholder="00:00" />
+                                <div class="hint">留空表示不做每日定时启动。</div>
+                            </div>
+                        </div>
+
+                        <div class="field-row">
+                            <div class="field checkbox">
+                                <input type="checkbox" name="auto_restart_on_stale" {% if selected_agent.auto_restart_on_stale %}checked{% endif %} />
+                                <label>上报 stale 时允许自动重启</label>
+                            </div>
+                            <div class="field">
+                                <label>启动宽限秒数</label>
+                                <input type="number" name="startup_grace_seconds" value="{{ selected_agent.startup_grace_seconds }}" />
+                            </div>
+                        </div>
+
+                        <div class="field-row">
+                            <div class="field">
+                                <label>重启冷却秒数</label>
+                                <input type="number" name="restart_cooldown_seconds" value="{{ selected_agent.restart_cooldown_seconds }}" />
+                            </div>
+                            <div class="field">
+                                <label>每日最多重启次数</label>
+                                <input type="number" name="max_restart_per_day" value="{{ selected_agent.max_restart_per_day }}" />
                             </div>
                         </div>
 
@@ -430,6 +470,26 @@
                     {% endif %}
                 </div>
             </form>
+
+            {% if selected_agent.agent_id %}
+            <div class="actions" style="margin-top: 10px;">
+                <form class="inline-form" method="post" action="/console/agents/action{{ auth_query_suffix }}">
+                    <input type="hidden" name="agent_id" value="{{ selected_agent.agent_id }}" />
+                    <input type="hidden" name="action" value="start_once" />
+                    <button class="btn" type="submit">启动一次</button>
+                </form>
+                <form class="inline-form" method="post" action="/console/agents/action{{ auth_query_suffix }}">
+                    <input type="hidden" name="agent_id" value="{{ selected_agent.agent_id }}" />
+                    <input type="hidden" name="action" value="restart_once" />
+                    <button class="btn" type="submit">重启一次</button>
+                </form>
+                <form class="inline-form" method="post" action="/console/agents/action{{ auth_query_suffix }}">
+                    <input type="hidden" name="agent_id" value="{{ selected_agent.agent_id }}" />
+                    <input type="hidden" name="action" value="sync_once" />
+                    <button class="btn" type="submit">只同步一次</button>
+                </form>
+            </div>
+            {% endif %}
 
             <details style="margin-top: 14px;">
                 <summary>资源管理（后面再用）</summary>
@@ -524,12 +584,14 @@
                                 {{ item.region or "-" }}
                                 <div class="small">Group {{ item.group_start }} - {{ item.group_end }}</div>
                                 <div class="small">{{ item.notes or "-" }}</div>
+                                <div class="small">控制: {{ item.desired_run_state }} / {{ item.schedule_daily_start or "未定时" }}</div>
                             </td>
                             <td>
                                 {{ item.profile_version or "-" }}
                                 <div class="small">脚本：{{ item.config_version or "-" }}</div>
                                 <div class="small">资源：{{ item.resource_manifest_version or "-" }}</div>
                                 <div class="small">下载：{% if item.exe_url %}已填写{% else %}未填写{% endif %}</div>
+                                <div class="small">重启：{% if item.auto_restart_on_stale %}自动{% else %}手动{% endif %} / {{ item.restart_cooldown_seconds }}s / {{ item.max_restart_per_day }}次</div>
                             </td>
                             <td>
                                 <div class="row-actions">
