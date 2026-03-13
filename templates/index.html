@@ -129,6 +129,13 @@
             flex-wrap: wrap;
         }
 
+        .toolbar-right {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            flex-wrap: wrap;
+        }
+
         .hint {
             color: var(--muted);
             font-size: 13px;
@@ -315,6 +322,8 @@
             <span>自动刷新：{{ ui_auto_refresh_seconds }} 秒</span>
             <span>布局模式：{% if ui_layout_mode == "grouped" %}按区服分组{% else %}普通列表{% endif %}</span>
             <span>时间：<span id="now">-</span></span>
+            <span>配置台 VM：{{ agent_profile_count }}</span>
+            <span>资源条目：{{ resource_item_count }}</span>
         </div>
     </div>
 
@@ -323,6 +332,9 @@
             <div class="toolbar-left">
                 <button class="btn btn-danger" onclick="clearAllAgents()">清空当前页面 Agent</button>
                 <span class="hint">页面展示由 .env 中的 UI_LAYOUT_MODE 和 UI_AUTO_REFRESH_SECONDS 控制</span>
+            </div>
+            <div class="toolbar-right">
+                <a class="btn" href="{{ console_url }}">打开配置台</a>
             </div>
             <div class="summary">
                 <span class="badge badge-accent">当前 Agent：{{ rows | length }}</span>

@@ -12,10 +12,11 @@ from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+from urllib.parse import parse_qs, urlencode
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, Header, HTTPException, Query, Request
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel, Field
 
@@ -49,6 +50,17 @@ def env_csv(name: str) -> List[str]:
     items: List[str] = []
     seen: set[str] = set()
     for part in re.split(r"[\r\n,]+", value):
+        item = part.strip()
+        if item and item not in seen:
+            items.append(item)
+            seen.add(item)
+    return items
+
+
+def split_csv_text(value: str) -> List[str]:
+    items: List[str] = []
+    seen: set[str] = set()
+    for part in re.split(r"[\r\n,]+", value or ""):
         item = part.strip()
         if item and item not in seen:
             items.append(item)
@@ -173,18 +185,8 @@ def ensure_auth(
 
 def init_db() -> None:
     global db_conn
-    if (
-        (not settings.persist_reports)
-        and settings.delete_db_on_startup
-        and settings.db_path.exists()
-    ):
-        try:
-            settings.db_path.unlink()
-            logger.info("deleted old db on startup: %s", settings.db_path)
-        except OSError as exc:
-            logger.warning("delete db failed: %s", exc)
-
     db_conn = sqlite3.connect(settings.db_path, check_same_thread=False)
+    db_conn.row_factory = sqlite3.Row
     with db_conn:
         db_conn.execute(
             """
@@ -231,6 +233,67 @@ def init_db() -> None:
             )
             """
         )
+        db_conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS agent_profiles (
+                agent_id TEXT PRIMARY KEY,
+                enabled INTEGER NOT NULL DEFAULT 1,
+                region TEXT DEFAULT '',
+                group_start INTEGER NOT NULL DEFAULT 0,
+                group_end INTEGER NOT NULL DEFAULT 0,
+                task_mode TEXT NOT NULL DEFAULT 'normal',
+                priority INTEGER NOT NULL DEFAULT 0,
+                profile_version TEXT NOT NULL,
+                config_version TEXT DEFAULT '',
+                config_payload TEXT DEFAULT '',
+                exe_version TEXT DEFAULT '',
+                exe_url TEXT DEFAULT '',
+                exe_sha256 TEXT DEFAULT '',
+                startup_exe TEXT DEFAULT 'QianNian.exe',
+                startup_args TEXT DEFAULT '',
+                script_entry TEXT DEFAULT '',
+                resource_manifest_version TEXT DEFAULT '',
+                notes TEXT DEFAULT '',
+                updated_at TEXT NOT NULL,
+                updated_epoch INTEGER NOT NULL
+            )
+            """
+        )
+        db_conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS resource_items (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL UNIQUE,
+                enabled INTEGER NOT NULL DEFAULT 1,
+                kind TEXT NOT NULL DEFAULT 'config',
+                version TEXT NOT NULL,
+                target_path TEXT DEFAULT '',
+                url TEXT DEFAULT '',
+                sha256 TEXT DEFAULT '',
+                size_bytes INTEGER NOT NULL DEFAULT 0,
+                target_agents TEXT DEFAULT '',
+                notes TEXT DEFAULT '',
+                updated_at TEXT NOT NULL,
+                updated_epoch INTEGER NOT NULL
+            )
+            """
+        )
+        db_conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_resource_items_enabled ON resource_items(enabled)"
+        )
+        db_conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_resource_items_kind ON resource_items(kind)"
+        )
+
+    if (not settings.persist_reports) and settings.delete_db_on_startup:
+        with db_lock:
+            with db_conn:
+                db_conn.execute("DELETE FROM reports")
+            try:
+                db_conn.execute("VACUUM")
+            except sqlite3.OperationalError as exc:
+                logger.warning("db vacuum skipped on startup: %s", exc)
+        logger.info("startup cleanup executed: reports cleared, config kept")
 
 
 def maybe_cleanup_db() -> None:
@@ -346,6 +409,461 @@ def list_history(limit: int) -> List[Dict[str, Any]]:
     with state_lock:
         data = list(history_cache)[:limit]
     return data
+
+
+def now_epoch() -> int:
+    return int(time.time())
+
+
+def parse_int(value: Any, default: int = 0) -> int:
+    try:
+        return int(str(value).strip())
+    except (TypeError, ValueError):
+        return default
+
+
+def parse_json_payload(raw_text: str) -> Any:
+    raw_text = (raw_text or "").strip()
+    if not raw_text:
+        return None
+    try:
+        return json.loads(raw_text)
+    except json.JSONDecodeError:
+        return None
+
+
+async def parse_request_form_data(request: Request) -> Dict[str, str]:
+    body = await request.body()
+    if not body:
+        return {}
+
+    parsed = parse_qs(body.decode("utf-8"), keep_blank_values=True)
+    return {key: values[-1] if values else "" for key, values in parsed.items()}
+
+
+def append_query_params(path: str, **params: Any) -> str:
+    filtered = {k: v for k, v in params.items() if v not in (None, "", [])}
+    if not filtered:
+        return path
+    return f"{path}?{urlencode(filtered)}"
+
+
+def resolve_download_url(request: Request, raw_url: str) -> str:
+    raw_url = (raw_url or "").strip()
+    if not raw_url:
+        return ""
+    if raw_url.startswith(("http://", "https://")):
+        return raw_url
+    return str(request.base_url).rstrip("/") + "/" + raw_url.lstrip("/")
+
+
+def build_console_redirect_url(
+    auth_token: Optional[str],
+    message: Optional[str] = None,
+    edit_agent: Optional[str] = None,
+    edit_resource_id: Optional[int] = None,
+) -> str:
+    return append_query_params(
+        "/console",
+        auth_token=auth_token,
+        message=message,
+        edit_agent=edit_agent,
+        edit_resource_id=edit_resource_id,
+    )
+
+
+def blank_agent_profile() -> Dict[str, Any]:
+    return {
+        "agent_id": "",
+        "enabled": True,
+        "region": "",
+        "group_start": 0,
+        "group_end": 0,
+        "task_mode": "normal",
+        "priority": 0,
+        "profile_version": "",
+        "config_version": "",
+        "config_payload": "",
+        "exe_version": "",
+        "exe_url": "",
+        "exe_sha256": "",
+        "startup_exe": "QianNian.exe",
+        "startup_args": "",
+        "script_entry": "",
+        "resource_manifest_version": "",
+        "notes": "",
+        "updated_at": "",
+        "updated_epoch": 0,
+    }
+
+
+def blank_resource_item() -> Dict[str, Any]:
+    return {
+        "id": 0,
+        "name": "",
+        "enabled": True,
+        "kind": "config",
+        "version": "",
+        "target_path": "",
+        "url": "",
+        "sha256": "",
+        "size_bytes": 0,
+        "target_agents": "",
+        "notes": "",
+        "updated_at": "",
+        "updated_epoch": 0,
+    }
+
+
+def row_to_agent_profile(row: sqlite3.Row) -> Dict[str, Any]:
+    return {
+        "agent_id": row["agent_id"],
+        "enabled": bool(row["enabled"]),
+        "region": row["region"] or "",
+        "group_start": row["group_start"],
+        "group_end": row["group_end"],
+        "task_mode": row["task_mode"] or "normal",
+        "priority": row["priority"],
+        "profile_version": row["profile_version"] or "",
+        "config_version": row["config_version"] or "",
+        "config_payload": row["config_payload"] or "",
+        "exe_version": row["exe_version"] or "",
+        "exe_url": row["exe_url"] or "",
+        "exe_sha256": row["exe_sha256"] or "",
+        "startup_exe": row["startup_exe"] or "QianNian.exe",
+        "startup_args": row["startup_args"] or "",
+        "script_entry": row["script_entry"] or "",
+        "resource_manifest_version": row["resource_manifest_version"] or "",
+        "notes": row["notes"] or "",
+        "updated_at": row["updated_at"],
+        "updated_epoch": row["updated_epoch"],
+    }
+
+
+def row_to_resource_item(row: sqlite3.Row) -> Dict[str, Any]:
+    return {
+        "id": row["id"],
+        "name": row["name"],
+        "enabled": bool(row["enabled"]),
+        "kind": row["kind"] or "config",
+        "version": row["version"] or "",
+        "target_path": row["target_path"] or "",
+        "url": row["url"] or "",
+        "sha256": row["sha256"] or "",
+        "size_bytes": row["size_bytes"],
+        "target_agents": row["target_agents"] or "",
+        "notes": row["notes"] or "",
+        "updated_at": row["updated_at"],
+        "updated_epoch": row["updated_epoch"],
+    }
+
+
+def list_agent_profiles() -> List[Dict[str, Any]]:
+    if not db_conn:
+        return []
+    with db_lock:
+        rows = db_conn.execute(
+            """
+            SELECT agent_id, enabled, region, group_start, group_end, task_mode, priority,
+                   profile_version, config_version, config_payload, exe_version, exe_url,
+                   exe_sha256, startup_exe, startup_args, script_entry,
+                   resource_manifest_version, notes, updated_at, updated_epoch
+            FROM agent_profiles
+            ORDER BY enabled DESC, agent_id ASC
+            """
+        ).fetchall()
+    return [row_to_agent_profile(row) for row in rows]
+
+
+def get_agent_profile(agent_id: str) -> Optional[Dict[str, Any]]:
+    if not db_conn or not agent_id:
+        return None
+    with db_lock:
+        row = db_conn.execute(
+            """
+            SELECT agent_id, enabled, region, group_start, group_end, task_mode, priority,
+                   profile_version, config_version, config_payload, exe_version, exe_url,
+                   exe_sha256, startup_exe, startup_args, script_entry,
+                   resource_manifest_version, notes, updated_at, updated_epoch
+            FROM agent_profiles
+            WHERE agent_id = ?
+            """,
+            (agent_id,),
+        ).fetchone()
+    return row_to_agent_profile(row) if row else None
+
+
+def upsert_agent_profile(profile: Dict[str, Any], original_agent_id: Optional[str]) -> None:
+    if not db_conn:
+        return
+    current_time = now_str()
+    current_epoch = now_epoch()
+    agent_id = profile["agent_id"]
+    profile_version = profile["profile_version"] or current_time
+
+    with db_lock:
+        with db_conn:
+            if original_agent_id and original_agent_id != agent_id:
+                db_conn.execute(
+                    "DELETE FROM agent_profiles WHERE agent_id = ?",
+                    (original_agent_id,),
+                )
+            db_conn.execute(
+                """
+                INSERT INTO agent_profiles (
+                    agent_id, enabled, region, group_start, group_end, task_mode, priority,
+                    profile_version, config_version, config_payload, exe_version, exe_url,
+                    exe_sha256, startup_exe, startup_args, script_entry,
+                    resource_manifest_version, notes, updated_at, updated_epoch
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(agent_id) DO UPDATE SET
+                    enabled=excluded.enabled,
+                    region=excluded.region,
+                    group_start=excluded.group_start,
+                    group_end=excluded.group_end,
+                    task_mode=excluded.task_mode,
+                    priority=excluded.priority,
+                    profile_version=excluded.profile_version,
+                    config_version=excluded.config_version,
+                    config_payload=excluded.config_payload,
+                    exe_version=excluded.exe_version,
+                    exe_url=excluded.exe_url,
+                    exe_sha256=excluded.exe_sha256,
+                    startup_exe=excluded.startup_exe,
+                    startup_args=excluded.startup_args,
+                    script_entry=excluded.script_entry,
+                    resource_manifest_version=excluded.resource_manifest_version,
+                    notes=excluded.notes,
+                    updated_at=excluded.updated_at,
+                    updated_epoch=excluded.updated_epoch
+                """,
+                (
+                    agent_id,
+                    1 if profile["enabled"] else 0,
+                    profile["region"],
+                    profile["group_start"],
+                    profile["group_end"],
+                    profile["task_mode"],
+                    profile["priority"],
+                    profile_version,
+                    profile["config_version"],
+                    profile["config_payload"],
+                    profile["exe_version"],
+                    profile["exe_url"],
+                    profile["exe_sha256"],
+                    profile["startup_exe"],
+                    profile["startup_args"],
+                    profile["script_entry"],
+                    profile["resource_manifest_version"],
+                    profile["notes"],
+                    current_time,
+                    current_epoch,
+                ),
+            )
+
+
+def delete_agent_profile(agent_id: str) -> int:
+    if not db_conn or not agent_id:
+        return 0
+    with db_lock:
+        with db_conn:
+            cur = db_conn.execute(
+                "DELETE FROM agent_profiles WHERE agent_id = ?",
+                (agent_id,),
+            )
+            return cur.rowcount
+
+
+def resource_applies_to_agent(resource: Dict[str, Any], agent_id: Optional[str]) -> bool:
+    targets = split_csv_text(resource.get("target_agents", ""))
+    if not targets:
+        return True
+    if not agent_id:
+        return False
+    return agent_id in targets
+
+
+def list_resource_items(
+    agent_id: Optional[str] = None,
+    enabled_only: bool = False,
+) -> List[Dict[str, Any]]:
+    if not db_conn:
+        return []
+    query = """
+        SELECT id, name, enabled, kind, version, target_path, url, sha256,
+               size_bytes, target_agents, notes, updated_at, updated_epoch
+        FROM resource_items
+    """
+    params: List[Any] = []
+    if enabled_only:
+        query += " WHERE enabled = ?"
+        params.append(1)
+    query += " ORDER BY enabled DESC, kind ASC, name ASC"
+
+    with db_lock:
+        rows = db_conn.execute(query, params).fetchall()
+    items = [row_to_resource_item(row) for row in rows]
+    if agent_id is None:
+        return items
+    return [item for item in items if resource_applies_to_agent(item, agent_id)]
+
+
+def get_resource_item(resource_id: int) -> Optional[Dict[str, Any]]:
+    if not db_conn or resource_id <= 0:
+        return None
+    with db_lock:
+        row = db_conn.execute(
+            """
+            SELECT id, name, enabled, kind, version, target_path, url, sha256,
+                   size_bytes, target_agents, notes, updated_at, updated_epoch
+            FROM resource_items
+            WHERE id = ?
+            """,
+            (resource_id,),
+        ).fetchone()
+    return row_to_resource_item(row) if row else None
+
+
+def upsert_resource_item(item: Dict[str, Any]) -> int:
+    if not db_conn:
+        return 0
+    current_time = now_str()
+    current_epoch = now_epoch()
+    version = item["version"] or current_time
+
+    with db_lock:
+        with db_conn:
+            db_conn.execute(
+                """
+                INSERT INTO resource_items (
+                    id, name, enabled, kind, version, target_path, url, sha256,
+                    size_bytes, target_agents, notes, updated_at, updated_epoch
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(name) DO UPDATE SET
+                    enabled=excluded.enabled,
+                    kind=excluded.kind,
+                    version=excluded.version,
+                    target_path=excluded.target_path,
+                    url=excluded.url,
+                    sha256=excluded.sha256,
+                    size_bytes=excluded.size_bytes,
+                    target_agents=excluded.target_agents,
+                    notes=excluded.notes,
+                    updated_at=excluded.updated_at,
+                    updated_epoch=excluded.updated_epoch
+                """,
+                (
+                    item["id"] if item["id"] > 0 else None,
+                    item["name"],
+                    1 if item["enabled"] else 0,
+                    item["kind"],
+                    version,
+                    item["target_path"],
+                    item["url"],
+                    item["sha256"],
+                    item["size_bytes"],
+                    item["target_agents"],
+                    item["notes"],
+                    current_time,
+                    current_epoch,
+                ),
+            )
+            row = db_conn.execute(
+                "SELECT id FROM resource_items WHERE name = ?",
+                (item["name"],),
+            ).fetchone()
+            return int(row[0]) if row else 0
+
+
+def delete_resource_item(resource_id: int) -> int:
+    if not db_conn or resource_id <= 0:
+        return 0
+    with db_lock:
+        with db_conn:
+            cur = db_conn.execute(
+                "DELETE FROM resource_items WHERE id = ?",
+                (resource_id,),
+            )
+            return cur.rowcount
+
+
+def build_manifest_items(request: Request, items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    manifest_items: List[Dict[str, Any]] = []
+    for item in items:
+        manifest_items.append(
+            {
+                "name": item["name"],
+                "enabled": item["enabled"],
+                "kind": item["kind"],
+                "version": item["version"],
+                "target_path": item["target_path"],
+                "url": resolve_download_url(request, item["url"]),
+                "sha256": item["sha256"],
+                "size_bytes": item["size_bytes"],
+                "target_agents": split_csv_text(item["target_agents"]),
+                "notes": item["notes"],
+                "updated_at": item["updated_at"],
+            }
+        )
+    return manifest_items
+
+
+def build_bootstrap_payload(
+    request: Request,
+    agent_profile: Dict[str, Any],
+    auth_token: Optional[str],
+) -> Dict[str, Any]:
+    manifest_url = append_query_params(
+        str(request.url_for("api_resources_manifest")),
+        agent_id=agent_profile["agent_id"],
+        auth_token=auth_token,
+    )
+    resources = list_resource_items(
+        agent_id=agent_profile["agent_id"],
+        enabled_only=True,
+    )
+    config_payload = parse_json_payload(agent_profile["config_payload"])
+    manifest_items = build_manifest_items(request, resources)
+
+    return {
+        "ok": True,
+        "server_time": now_str(),
+        "agent_id": agent_profile["agent_id"],
+        "profile_version": agent_profile["profile_version"],
+        "task": {
+            "enabled": agent_profile["enabled"],
+            "region": agent_profile["region"],
+            "group_start": agent_profile["group_start"],
+            "group_end": agent_profile["group_end"],
+            "task_mode": agent_profile["task_mode"],
+            "priority": agent_profile["priority"],
+            "notes": agent_profile["notes"],
+        },
+        "config": {
+            "version": agent_profile["config_version"],
+            "payload_text": agent_profile["config_payload"],
+            "payload_json": config_payload,
+        },
+        "launch": {
+            "startup_exe": agent_profile["startup_exe"],
+            "startup_args": agent_profile["startup_args"],
+            "script_entry": agent_profile["script_entry"],
+        },
+        "downloads": {
+            "exe": {
+                "version": agent_profile["exe_version"],
+                "url": resolve_download_url(request, agent_profile["exe_url"]),
+                "sha256": agent_profile["exe_sha256"],
+            },
+            "resources_manifest": {
+                "version": agent_profile["resource_manifest_version"],
+                "url": manifest_url,
+                "count": len(manifest_items),
+            },
+        },
+        "resources": manifest_items,
+        "updated_at": agent_profile["updated_at"],
+    }
 
 
 def get_region_stats() -> Dict[str, Any]:
@@ -628,7 +1146,10 @@ async def on_shutdown() -> None:
 
 
 @app.get("/", response_class=HTMLResponse)
-async def index(request: Request) -> HTMLResponse:
+async def index(
+    request: Request,
+    auth_token: Optional[str] = Query(default=None),
+) -> HTMLResponse:
     rows = build_rows()
     region_groups = build_region_groups(rows)
     return templates.TemplateResponse(
@@ -642,7 +1163,169 @@ async def index(request: Request) -> HTMLResponse:
             "rows": rows,
             "region_groups": region_groups,
             "region_stats": get_region_stats(),
+            "auth_token": auth_token or "",
+            "console_url": append_query_params("/console", auth_token=auth_token),
+            "agent_profile_count": len(list_agent_profiles()),
+            "resource_item_count": len(list_resource_items()),
         },
+    )
+
+
+@app.get("/console", response_class=HTMLResponse)
+async def config_console(
+    request: Request,
+    auth_token: Optional[str] = Query(default=None),
+    edit_agent: Optional[str] = Query(default=None),
+    edit_resource_id: int = Query(default=0),
+    message: str = Query(default=""),
+) -> HTMLResponse:
+    ensure_auth(None, auth_token)
+
+    agent_profiles = list_agent_profiles()
+    resource_items = list_resource_items()
+    selected_agent = get_agent_profile(edit_agent or "") or blank_agent_profile()
+    selected_resource = get_resource_item(edit_resource_id) or blank_resource_item()
+
+    return templates.TemplateResponse(
+        "config_console.html",
+        {
+            "request": request,
+            "app_name": settings.app_name,
+            "auth_token": auth_token or "",
+            "auth_query_suffix": append_query_params("", auth_token=auth_token),
+            "message": message,
+            "agent_profiles": agent_profiles,
+            "resource_items": resource_items,
+            "selected_agent": selected_agent,
+            "selected_resource": selected_resource,
+            "dashboard_url": append_query_params("/", auth_token=auth_token),
+            "agent_profile_count": len(agent_profiles),
+            "resource_item_count": len(resource_items),
+        },
+    )
+
+
+@app.post("/console/agents/save")
+async def console_agent_save(
+    request: Request,
+    auth_token: Optional[str] = Query(default=None),
+) -> RedirectResponse:
+    ensure_auth(None, auth_token)
+    form = await parse_request_form_data(request)
+
+    agent_id = str(form.get("agent_id", "")).strip()
+    if not agent_id:
+        return RedirectResponse(
+            build_console_redirect_url(auth_token, "Agent ID 不能为空"),
+            status_code=303,
+        )
+
+    profile = {
+        "agent_id": agent_id,
+        "enabled": form.get("enabled") == "on",
+        "region": str(form.get("region", "")).strip(),
+        "group_start": parse_int(form.get("group_start"), 0),
+        "group_end": parse_int(form.get("group_end"), 0),
+        "task_mode": str(form.get("task_mode", "normal")).strip() or "normal",
+        "priority": parse_int(form.get("priority"), 0),
+        "profile_version": str(form.get("profile_version", "")).strip(),
+        "config_version": str(form.get("config_version", "")).strip(),
+        "config_payload": str(form.get("config_payload", "")),
+        "exe_version": str(form.get("exe_version", "")).strip(),
+        "exe_url": str(form.get("exe_url", "")).strip(),
+        "exe_sha256": str(form.get("exe_sha256", "")).strip(),
+        "startup_exe": str(form.get("startup_exe", "QianNian.exe")).strip()
+        or "QianNian.exe",
+        "startup_args": str(form.get("startup_args", "")).strip(),
+        "script_entry": str(form.get("script_entry", "")).strip(),
+        "resource_manifest_version": str(
+            form.get("resource_manifest_version", "")
+        ).strip(),
+        "notes": str(form.get("notes", "")).strip(),
+    }
+
+    original_agent_id = str(form.get("original_agent_id", "")).strip() or None
+    upsert_agent_profile(profile, original_agent_id)
+    return RedirectResponse(
+        build_console_redirect_url(
+            auth_token,
+            f"{agent_id} 配置已保存",
+            edit_agent=agent_id,
+        ),
+        status_code=303,
+    )
+
+
+@app.post("/console/agents/delete")
+async def console_agent_delete(
+    request: Request,
+    auth_token: Optional[str] = Query(default=None),
+) -> RedirectResponse:
+    ensure_auth(None, auth_token)
+    form = await parse_request_form_data(request)
+    agent_id = str(form.get("agent_id", "")).strip()
+    if agent_id:
+        delete_agent_profile(agent_id)
+    return RedirectResponse(
+        build_console_redirect_url(auth_token, f"{agent_id or 'Agent'} 配置已删除"),
+        status_code=303,
+    )
+
+
+@app.post("/console/resources/save")
+async def console_resource_save(
+    request: Request,
+    auth_token: Optional[str] = Query(default=None),
+) -> RedirectResponse:
+    ensure_auth(None, auth_token)
+    form = await parse_request_form_data(request)
+
+    name = str(form.get("name", "")).strip()
+    if not name:
+        return RedirectResponse(
+            build_console_redirect_url(auth_token, "资源名称不能为空"),
+            status_code=303,
+        )
+
+    item = {
+        "id": parse_int(form.get("resource_id"), 0),
+        "name": name,
+        "enabled": form.get("enabled") == "on",
+        "kind": str(form.get("kind", "config")).strip() or "config",
+        "version": str(form.get("version", "")).strip(),
+        "target_path": str(form.get("target_path", "")).strip(),
+        "url": str(form.get("url", "")).strip(),
+        "sha256": str(form.get("sha256", "")).strip(),
+        "size_bytes": parse_int(form.get("size_bytes"), 0),
+        "target_agents": str(form.get("target_agents", "")).strip(),
+        "notes": str(form.get("notes", "")).strip(),
+    }
+    resource_id = upsert_resource_item(item)
+    return RedirectResponse(
+        build_console_redirect_url(
+            auth_token,
+            f"{name} 资源已保存",
+            edit_resource_id=resource_id,
+        ),
+        status_code=303,
+    )
+
+
+@app.post("/console/resources/delete")
+async def console_resource_delete(
+    request: Request,
+    auth_token: Optional[str] = Query(default=None),
+) -> RedirectResponse:
+    ensure_auth(None, auth_token)
+    form = await parse_request_form_data(request)
+    resource_id = parse_int(form.get("resource_id"), 0)
+    resource = get_resource_item(resource_id)
+    if resource_id > 0:
+        delete_resource_item(resource_id)
+    resource_name = resource["name"] if resource else "资源"
+    return RedirectResponse(
+        build_console_redirect_url(auth_token, f"{resource_name} 已删除"),
+        status_code=303,
     )
 
 
@@ -661,6 +1344,38 @@ async def api_history(limit: int = 100) -> Dict[str, Any]:
 @app.get("/api/region_stats")
 async def api_region_stats() -> Dict[str, Any]:
     return {"ok": True, **get_region_stats()}
+
+
+@app.get("/api/bootstrap")
+async def api_bootstrap(
+    request: Request,
+    agent_id: str = Query(min_length=1),
+    x_auth_token: Optional[str] = Header(default=None),
+    auth_token: Optional[str] = Query(default=None),
+) -> Dict[str, Any]:
+    ensure_auth(x_auth_token, auth_token)
+    agent_profile = get_agent_profile(agent_id)
+    if not agent_profile:
+        raise HTTPException(status_code=404, detail="agent profile not found")
+    return build_bootstrap_payload(request, agent_profile, auth_token)
+
+
+@app.get("/api/resources/manifest", name="api_resources_manifest")
+async def api_resources_manifest(
+    request: Request,
+    agent_id: Optional[str] = Query(default=None),
+    x_auth_token: Optional[str] = Header(default=None),
+    auth_token: Optional[str] = Query(default=None),
+) -> Dict[str, Any]:
+    ensure_auth(x_auth_token, auth_token)
+    resources = list_resource_items(agent_id=agent_id, enabled_only=True)
+    return {
+        "ok": True,
+        "server_time": now_str(),
+        "agent_id": agent_id,
+        "count": len(resources),
+        "items": build_manifest_items(request, resources),
+    }
 
 
 @app.post("/api/report")
