@@ -129,6 +129,20 @@ logging.basicConfig(
 )
 logger = logging.getLogger("local_report")
 
+VALID_DESIRED_RUN_STATES = {"run", "stop"}
+VALID_DESIRED_ACTIONS = {"", "start_once", "restart_once", "sync_once", "stop_once"}
+
+AGENT_PROFILE_SELECT_FIELDS = """
+    agent_id, enabled, region, group_start, group_end, task_mode, priority,
+    profile_version, config_version, config_payload, exe_version, exe_url,
+    exe_sha256, startup_exe, startup_args, script_entry,
+    resource_manifest_version, notes,
+    desired_run_state, schedule_daily_start, auto_restart_on_stale,
+    restart_cooldown_seconds, max_restart_per_day, startup_grace_seconds,
+    desired_action, action_seq,
+    updated_at, updated_epoch
+"""
+
 
 class ReportPayload(BaseModel):
     event: str = Field(default="group_complete_ready_next")
@@ -258,6 +272,19 @@ def init_db() -> None:
                 updated_epoch INTEGER NOT NULL
             )
             """
+        )
+        ensure_table_columns(
+            "agent_profiles",
+            {
+                "desired_run_state": "TEXT NOT NULL DEFAULT 'run'",
+                "schedule_daily_start": "TEXT DEFAULT ''",
+                "auto_restart_on_stale": "INTEGER NOT NULL DEFAULT 1",
+                "restart_cooldown_seconds": "INTEGER NOT NULL DEFAULT 600",
+                "max_restart_per_day": "INTEGER NOT NULL DEFAULT 3",
+                "startup_grace_seconds": "INTEGER NOT NULL DEFAULT 300",
+                "desired_action": "TEXT DEFAULT ''",
+                "action_seq": "INTEGER NOT NULL DEFAULT 0",
+            },
         )
         db_conn.execute(
             """
@@ -472,6 +499,112 @@ def build_console_redirect_url(
     )
 
 
+def normalize_desired_run_state(value: Any) -> str:
+    text = str(value or "").strip().lower()
+    if text in VALID_DESIRED_RUN_STATES:
+        return text
+    return "run"
+
+
+def normalize_desired_action(value: Any) -> str:
+    text = str(value or "").strip().lower()
+    if text in VALID_DESIRED_ACTIONS:
+        return text
+    return ""
+
+
+def normalize_daily_start(value: Any) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+
+    match = re.fullmatch(r"(\d{1,2}):(\d{2})", text)
+    if not match:
+        return ""
+
+    hour = int(match.group(1))
+    minute = int(match.group(2))
+    if hour < 0 or hour > 23 or minute < 0 or minute > 59:
+        return ""
+    return f"{hour:02d}:{minute:02d}"
+
+
+def ensure_table_columns(table_name: str, column_defs: Dict[str, str]) -> None:
+    if not db_conn:
+        return
+
+    existing_columns = {
+        row[1] for row in db_conn.execute(f"PRAGMA table_info({table_name})").fetchall()
+    }
+    for column_name, definition in column_defs.items():
+        if column_name in existing_columns:
+            continue
+        db_conn.execute(f"ALTER TABLE {table_name} ADD COLUMN {column_name} {definition}")
+
+
+def build_agent_control(agent_profile: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "desired_run_state": normalize_desired_run_state(
+            agent_profile.get("desired_run_state", "run")
+        ),
+        "schedule_daily_start": normalize_daily_start(
+            agent_profile.get("schedule_daily_start", "")
+        ),
+        "auto_restart_on_stale": bool(
+            agent_profile.get("auto_restart_on_stale", True)
+        ),
+        "restart_cooldown_seconds": max(
+            0, parse_int(agent_profile.get("restart_cooldown_seconds"), 600)
+        ),
+        "max_restart_per_day": max(
+            0, parse_int(agent_profile.get("max_restart_per_day"), 3)
+        ),
+        "startup_grace_seconds": max(
+            0, parse_int(agent_profile.get("startup_grace_seconds"), 300)
+        ),
+        "desired_action": normalize_desired_action(
+            agent_profile.get("desired_action", "")
+        ),
+        "action_seq": max(0, parse_int(agent_profile.get("action_seq"), 0)),
+    }
+
+
+def build_agent_runtime_snapshot(agent_id: str) -> Dict[str, Any]:
+    now_ts = time.time()
+    with state_lock:
+        item = dict(agent_states.get(agent_id, {}))
+
+    if not item:
+        return {
+            "has_report": False,
+            "report_timeout_seconds": settings.alert_timeout_seconds,
+            "stale": False,
+            "elapsed": None,
+            "server_time": "",
+            "server_epoch": 0,
+            "current_group": 0,
+            "finished_group": 0,
+            "next_group": 0,
+            "role_index": 0,
+            "event": "",
+        }
+
+    elapsed = int(max(0, now_ts - float(item.get("server_epoch", 0))))
+    return {
+        "has_report": True,
+        "report_timeout_seconds": settings.alert_timeout_seconds,
+        "stale": elapsed > settings.alert_timeout_seconds,
+        "elapsed": elapsed,
+        "server_time": item.get("server_time", ""),
+        "server_epoch": item.get("server_epoch", 0),
+        "current_group": item.get("current_group", 0),
+        "finished_group": item.get("finished_group", 0),
+        "next_group": item.get("next_group", 0),
+        "role_index": item.get("role_index", 0),
+        "event": item.get("event", ""),
+    }
+
+
 def blank_agent_profile() -> Dict[str, Any]:
     return {
         "agent_id": "",
@@ -492,6 +625,14 @@ def blank_agent_profile() -> Dict[str, Any]:
         "script_entry": "",
         "resource_manifest_version": "",
         "notes": "",
+        "desired_run_state": "run",
+        "schedule_daily_start": "",
+        "auto_restart_on_stale": True,
+        "restart_cooldown_seconds": 600,
+        "max_restart_per_day": 3,
+        "startup_grace_seconds": 300,
+        "desired_action": "",
+        "action_seq": 0,
         "updated_at": "",
         "updated_epoch": 0,
     }
@@ -535,6 +676,40 @@ def row_to_agent_profile(row: sqlite3.Row) -> Dict[str, Any]:
         "script_entry": row["script_entry"] or "",
         "resource_manifest_version": row["resource_manifest_version"] or "",
         "notes": row["notes"] or "",
+        "desired_run_state": normalize_desired_run_state(
+            row["desired_run_state"] if "desired_run_state" in row.keys() else "run"
+        ),
+        "schedule_daily_start": normalize_daily_start(
+            row["schedule_daily_start"] if "schedule_daily_start" in row.keys() else ""
+        ),
+        "auto_restart_on_stale": bool(
+            row["auto_restart_on_stale"]
+            if "auto_restart_on_stale" in row.keys()
+            else True
+        ),
+        "restart_cooldown_seconds": parse_int(
+            row["restart_cooldown_seconds"]
+            if "restart_cooldown_seconds" in row.keys()
+            else 600,
+            600,
+        ),
+        "max_restart_per_day": parse_int(
+            row["max_restart_per_day"] if "max_restart_per_day" in row.keys() else 3,
+            3,
+        ),
+        "startup_grace_seconds": parse_int(
+            row["startup_grace_seconds"]
+            if "startup_grace_seconds" in row.keys()
+            else 300,
+            300,
+        ),
+        "desired_action": normalize_desired_action(
+            row["desired_action"] if "desired_action" in row.keys() else ""
+        ),
+        "action_seq": parse_int(
+            row["action_seq"] if "action_seq" in row.keys() else 0,
+            0,
+        ),
         "updated_at": row["updated_at"],
         "updated_epoch": row["updated_epoch"],
     }
@@ -564,10 +739,11 @@ def list_agent_profiles() -> List[Dict[str, Any]]:
     with db_lock:
         rows = db_conn.execute(
             """
-            SELECT agent_id, enabled, region, group_start, group_end, task_mode, priority,
-                   profile_version, config_version, config_payload, exe_version, exe_url,
-                   exe_sha256, startup_exe, startup_args, script_entry,
-                   resource_manifest_version, notes, updated_at, updated_epoch
+            SELECT
+            """
+            + AGENT_PROFILE_SELECT_FIELDS
+            +
+            """
             FROM agent_profiles
             ORDER BY enabled DESC, agent_id ASC
             """
@@ -581,10 +757,11 @@ def get_agent_profile(agent_id: str) -> Optional[Dict[str, Any]]:
     with db_lock:
         row = db_conn.execute(
             """
-            SELECT agent_id, enabled, region, group_start, group_end, task_mode, priority,
-                   profile_version, config_version, config_payload, exe_version, exe_url,
-                   exe_sha256, startup_exe, startup_args, script_entry,
-                   resource_manifest_version, notes, updated_at, updated_epoch
+            SELECT
+            """
+            + AGENT_PROFILE_SELECT_FIELDS
+            +
+            """
             FROM agent_profiles
             WHERE agent_id = ?
             """,
@@ -614,8 +791,12 @@ def upsert_agent_profile(profile: Dict[str, Any], original_agent_id: Optional[st
                     agent_id, enabled, region, group_start, group_end, task_mode, priority,
                     profile_version, config_version, config_payload, exe_version, exe_url,
                     exe_sha256, startup_exe, startup_args, script_entry,
-                    resource_manifest_version, notes, updated_at, updated_epoch
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    resource_manifest_version, notes,
+                    desired_run_state, schedule_daily_start, auto_restart_on_stale,
+                    restart_cooldown_seconds, max_restart_per_day, startup_grace_seconds,
+                    desired_action, action_seq,
+                    updated_at, updated_epoch
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(agent_id) DO UPDATE SET
                     enabled=excluded.enabled,
                     region=excluded.region,
@@ -634,6 +815,14 @@ def upsert_agent_profile(profile: Dict[str, Any], original_agent_id: Optional[st
                     script_entry=excluded.script_entry,
                     resource_manifest_version=excluded.resource_manifest_version,
                     notes=excluded.notes,
+                    desired_run_state=excluded.desired_run_state,
+                    schedule_daily_start=excluded.schedule_daily_start,
+                    auto_restart_on_stale=excluded.auto_restart_on_stale,
+                    restart_cooldown_seconds=excluded.restart_cooldown_seconds,
+                    max_restart_per_day=excluded.max_restart_per_day,
+                    startup_grace_seconds=excluded.startup_grace_seconds,
+                    desired_action=excluded.desired_action,
+                    action_seq=excluded.action_seq,
                     updated_at=excluded.updated_at,
                     updated_epoch=excluded.updated_epoch
                 """,
@@ -656,10 +845,53 @@ def upsert_agent_profile(profile: Dict[str, Any], original_agent_id: Optional[st
                     profile["script_entry"],
                     profile["resource_manifest_version"],
                     profile["notes"],
+                    normalize_desired_run_state(profile.get("desired_run_state", "run")),
+                    normalize_daily_start(profile.get("schedule_daily_start", "")),
+                    1 if profile.get("auto_restart_on_stale", True) else 0,
+                    max(0, parse_int(profile.get("restart_cooldown_seconds"), 600)),
+                    max(0, parse_int(profile.get("max_restart_per_day"), 3)),
+                    max(0, parse_int(profile.get("startup_grace_seconds"), 300)),
+                    normalize_desired_action(profile.get("desired_action", "")),
+                    max(0, parse_int(profile.get("action_seq"), 0)),
                     current_time,
                     current_epoch,
                 ),
             )
+
+
+def bump_agent_action(agent_id: str, action: str) -> int:
+    if not db_conn or not agent_id:
+        return 0
+
+    normalized_action = normalize_desired_action(action)
+    if not normalized_action:
+        return 0
+
+    current_time = now_str()
+    current_epoch = now_epoch()
+
+    with db_lock:
+        with db_conn:
+            row = db_conn.execute(
+                "SELECT action_seq FROM agent_profiles WHERE agent_id = ?",
+                (agent_id,),
+            ).fetchone()
+            if not row:
+                return 0
+
+            next_seq = parse_int(row["action_seq"], 0) + 1
+            db_conn.execute(
+                """
+                UPDATE agent_profiles
+                SET desired_action = ?,
+                    action_seq = ?,
+                    updated_at = ?,
+                    updated_epoch = ?
+                WHERE agent_id = ?
+                """,
+                (normalized_action, next_seq, current_time, current_epoch, agent_id),
+            )
+            return next_seq
 
 
 def delete_agent_profile(agent_id: str) -> int:
@@ -839,6 +1071,7 @@ def build_bootstrap_payload(
             "priority": agent_profile["priority"],
             "notes": agent_profile["notes"],
         },
+        "control": build_agent_control(agent_profile),
         "config": {
             "version": agent_profile["config_version"],
             "payload_text": agent_profile["config_payload"],
@@ -1242,6 +1475,22 @@ async def console_agent_save(
             form.get("resource_manifest_version", "")
         ).strip(),
         "notes": str(form.get("notes", "")).strip(),
+        "desired_run_state": normalize_desired_run_state(
+            form.get("desired_run_state", "run")
+        ),
+        "schedule_daily_start": normalize_daily_start(
+            form.get("schedule_daily_start", "")
+        ),
+        "auto_restart_on_stale": form.get("auto_restart_on_stale") == "on",
+        "restart_cooldown_seconds": max(
+            0, parse_int(form.get("restart_cooldown_seconds"), 600)
+        ),
+        "max_restart_per_day": max(0, parse_int(form.get("max_restart_per_day"), 3)),
+        "startup_grace_seconds": max(
+            0, parse_int(form.get("startup_grace_seconds"), 300)
+        ),
+        "desired_action": normalize_desired_action(form.get("desired_action", "")),
+        "action_seq": max(0, parse_int(form.get("action_seq"), 0)),
     }
 
     original_agent_id = str(form.get("original_agent_id", "")).strip() or None
@@ -1250,6 +1499,43 @@ async def console_agent_save(
         build_console_redirect_url(
             auth_token,
             f"{agent_id} 配置已保存",
+            edit_agent=agent_id,
+        ),
+        status_code=303,
+    )
+
+
+@app.post("/console/agents/action")
+async def console_agent_action(
+    request: Request,
+    auth_token: Optional[str] = Query(default=None),
+) -> RedirectResponse:
+    ensure_auth(None, auth_token)
+    form = await parse_request_form_data(request)
+
+    agent_id = str(form.get("agent_id", "")).strip()
+    action = normalize_desired_action(form.get("action", ""))
+    if not agent_id or not action:
+        return RedirectResponse(
+            build_console_redirect_url(auth_token, "未指定有效动作或 Agent"),
+            status_code=303,
+        )
+
+    action_seq = bump_agent_action(agent_id, action)
+    if action_seq <= 0:
+        return RedirectResponse(
+            build_console_redirect_url(
+                auth_token,
+                f"{agent_id} 动作下发失败",
+                edit_agent=agent_id,
+            ),
+            status_code=303,
+        )
+
+    return RedirectResponse(
+        build_console_redirect_url(
+            auth_token,
+            f"{agent_id} 已下发动作 {action} (seq={action_seq})",
             edit_agent=agent_id,
         ),
         status_code=303,
@@ -1358,6 +1644,36 @@ async def api_bootstrap(
     if not agent_profile:
         raise HTTPException(status_code=404, detail="agent profile not found")
     return build_bootstrap_payload(request, agent_profile, auth_token)
+
+
+@app.get("/api/agent/control")
+async def api_agent_control(
+    agent_id: str = Query(min_length=1),
+    x_auth_token: Optional[str] = Header(default=None),
+    auth_token: Optional[str] = Query(default=None),
+) -> Dict[str, Any]:
+    ensure_auth(x_auth_token, auth_token)
+    agent_profile = get_agent_profile(agent_id)
+    if not agent_profile:
+        raise HTTPException(status_code=404, detail="agent profile not found")
+
+    return {
+        "ok": True,
+        "server_time": now_str(),
+        "agent_id": agent_profile["agent_id"],
+        "profile_version": agent_profile["profile_version"],
+        "task": {
+            "enabled": agent_profile["enabled"],
+            "region": agent_profile["region"],
+            "group_start": agent_profile["group_start"],
+            "group_end": agent_profile["group_end"],
+            "task_mode": agent_profile["task_mode"],
+            "priority": agent_profile["priority"],
+        },
+        "control": build_agent_control(agent_profile),
+        "runtime": build_agent_runtime_snapshot(agent_profile["agent_id"]),
+        "updated_at": agent_profile["updated_at"],
+    }
 
 
 @app.get("/api/resources/manifest", name="api_resources_manifest")
