@@ -1,0 +1,89 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>{{ app_name }} - 资源控制台</title>
+<style>
+*{box-sizing:border-box}
+body{margin:0;background:#f5f7fb;color:#132238;font:14px "Segoe UI","Microsoft YaHei",sans-serif}
+.page{max-width:1400px;margin:0 auto;padding:20px}
+.card{background:#fff;border:1px solid #d9e2ec;border-radius:16px;padding:16px;margin-bottom:16px}
+.top,.row,.actions{display:flex;gap:10px;flex-wrap:wrap}
+.top{justify-content:space-between;align-items:flex-start}
+.grid{display:grid;grid-template-columns:minmax(340px,420px) minmax(0,1fr);gap:16px;align-items:start}
+.fields{display:grid;gap:12px}
+.fields>*{min-width:0}
+.two{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px;align-items:start}
+.two>*{min-width:0}
+.btn{display:inline-flex;align-items:center;justify-content:center;padding:8px 12px;border:1px solid #b8c5d6;border-radius:10px;background:#fff;color:#132238;text-decoration:none;cursor:pointer}
+.primary{background:#0f766e;border-color:#0f766e;color:#fff}
+.danger{background:#fff1f1;border-color:#ef4444;color:#b42318}
+.msg{padding:10px 12px;border:1px solid #b7ead9;background:#ecfdf5;border-radius:12px;margin:16px 0}
+.pill{padding:6px 10px;border:1px solid #d9e2ec;border-radius:999px;background:#fff;color:#5a6b7f}
+.hint{color:#5a6b7f;line-height:1.6}
+.inline-check{display:flex;align-items:center;gap:8px;width:100%;min-height:44px;padding:10px 12px;border:1px solid #d9e2ec;border-radius:12px;background:#f8fbff;line-height:1.4}
+.fields>.two>label,.fields>label{display:grid;gap:6px;color:#5a6b7f;min-width:0}
+input[type="text"],input[type="number"],select{display:block;width:100%;max-width:100%;padding:10px 12px;border:1px solid #b8c5d6;border-radius:10px;background:#fff;color:#132238;font:14px inherit}
+input[type="checkbox"]{width:16px;height:16px;min-width:16px;flex:0 0 16px;margin:0;padding:0}
+table{width:100%;border-collapse:collapse}
+th,td{padding:10px 8px;border-bottom:1px solid #d9e2ec;text-align:left;vertical-align:top}
+th{font-size:13px;color:#5a6b7f;background:#f8fbff}
+tr.active td{background:#f3fcf8}
+.table{overflow:auto}
+@media (max-width:980px){.grid,.two{grid-template-columns:1fr}}
+</style>
+</head>
+<body>
+<div class="page">
+  <div class="card top">
+    <div>
+      <h1 style="margin:0 0 8px">资源控制台</h1>
+      <div class="hint">这里单独维护资源下发项。主控制台只管 Agent 任务参数，不再混放资源和下载配置。</div>
+    </div>
+    <div class="actions">
+      <a class="btn" href="{{ dashboard_url }}">状态看板</a>
+      <a class="btn" href="{{ main_console_url }}">返回 Agent 控制台</a>
+    </div>
+  </div>
+  {% if message %}<div class="msg">{{ message }}</div>{% endif %}
+  <div class="row" style="margin-bottom:16px"><span class="pill">资源: {{ resource_item_count }}</span><span class="pill">当前: {{ selected_resource.name or '新建资源' }}</span></div>
+  <div class="grid">
+    <div class="card">
+      <div class="top" style="margin-bottom:12px"><h2 style="margin:0">资源列表</h2><form method="get" action="/console/resources"><input type="hidden" name="auth_token" value="{{ auth_token }}"><button class="btn" type="submit">新建空白</button></form></div>
+      <div class="table"><table><thead><tr><th>名称</th><th>类型</th><th>版本</th><th>状态</th><th></th></tr></thead><tbody>{% for item in resource_items %}<tr class="{% if item.id == selected_resource.id %}active{% endif %}"><td><strong>{{ item.name }}</strong><br><span class="hint">{{ item.target_path or '-' }}</span></td><td>{{ item.kind }}</td><td>{{ item.version or '-' }}</td><td>{{ '启用' if item.enabled else '停用' }}</td><td><form method="get" action="/console/resources"><input type="hidden" name="auth_token" value="{{ auth_token }}"><input type="hidden" name="edit_resource_id" value="{{ item.id }}"><button class="btn" type="submit">编辑</button></form></td></tr>{% else %}<tr><td colspan="5">还没有资源配置。</td></tr>{% endfor %}</tbody></table></div>
+    </div>
+    <div class="card">
+      <h2 style="margin-top:0">{{ selected_resource.id and '编辑资源' or '新建资源' }}</h2>
+      <form method="post" action="/console/resources/save{{ auth_query_suffix }}">
+        <input type="hidden" name="resource_id" value="{{ selected_resource.id }}">
+        <div class="fields">
+          <div class="two">
+            <label>资源名称<input type="text" name="name" value="{{ selected_resource.name }}" required></label>
+            <div><div style="color:#5a6b7f;font-size:13px;margin-bottom:6px">是否启用</div><label class="inline-check"><input type="checkbox" name="enabled" {% if selected_resource.enabled %}checked{% endif %}>启用该资源</label></div>
+          </div>
+          <div class="two">
+            <label>资源类型<select name="kind"><option value="config" {% if selected_resource.kind == 'config' %}selected{% endif %}>config</option><option value="text" {% if selected_resource.kind == 'text' %}selected{% endif %}>text</option><option value="zip" {% if selected_resource.kind == 'zip' %}selected{% endif %}>zip</option><option value="exe" {% if selected_resource.kind == 'exe' %}selected{% endif %}>exe</option></select></label>
+            <label>版本<input type="text" name="version" value="{{ selected_resource.version }}"></label>
+          </div>
+          <div class="two">
+            <label>目标路径<input type="text" name="target_path" value="{{ selected_resource.target_path }}" placeholder="例如 runtime/config.txt"></label>
+            <label>目标 Agent<input type="text" name="target_agents" value="{{ selected_resource.target_agents }}" placeholder="留空表示全部"></label>
+          </div>
+          <div class="two">
+            <label>下载地址<input type="text" name="url" value="{{ selected_resource.url }}"></label>
+            <label>SHA256<input type="text" name="sha256" value="{{ selected_resource.sha256 }}"></label>
+          </div>
+          <div class="two">
+            <label>大小 bytes<input type="number" name="size_bytes" value="{{ selected_resource.size_bytes }}" min="0"></label>
+            <label>备注<input type="text" name="notes" value="{{ selected_resource.notes }}"></label>
+          </div>
+        </div>
+        <div class="actions" style="margin-top:16px"><button class="btn primary" type="submit">保存资源</button></div>
+      </form>
+      {% if selected_resource.id %}<form method="post" action="/console/resources/delete{{ auth_query_suffix }}" onsubmit="return confirm('确认删除当前资源吗？');" style="margin-top:16px"><input type="hidden" name="resource_id" value="{{ selected_resource.id }}"><button class="btn danger" type="submit">删除 {{ selected_resource.name }}</button></form>{% endif %}
+    </div>
+  </div>
+</div>
+</body>
+</html>

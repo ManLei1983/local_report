@@ -1,623 +1,153 @@
 <!doctype html>
 <html lang="zh-CN">
 <head>
-    <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>{{ app_name }} 配置台</title>
-    <style>
-        :root {
-            --bg: #f4f6fb;
-            --card: #ffffff;
-            --line: #dbe2ea;
-            --line-strong: #c7d0db;
-            --text: #17202b;
-            --muted: #607083;
-            --accent: #165dff;
-            --accent-soft: #eff5ff;
-            --warn: #dc2626;
-            --shadow: 0 10px 30px rgba(23, 32, 43, 0.06);
-        }
-
-        * {
-            box-sizing: border-box;
-        }
-
-        body {
-            margin: 0;
-            background:
-                radial-gradient(circle at top left, rgba(22, 93, 255, 0.08), transparent 24%),
-                linear-gradient(180deg, #f7f9fc 0%, #eef3f9 100%);
-            color: var(--text);
-            font-family: "Segoe UI", "PingFang SC", "Microsoft YaHei", Arial, sans-serif;
-        }
-
-        .container {
-            max-width: 1280px;
-            margin: 20px auto;
-            padding: 0 14px 24px;
-        }
-
-        .card {
-            background: var(--card);
-            border: 1px solid var(--line);
-            border-radius: 16px;
-            padding: 16px;
-            margin-bottom: 16px;
-            box-shadow: var(--shadow);
-        }
-
-        h1 {
-            margin: 0 0 10px 0;
-            font-size: 32px;
-            line-height: 1.05;
-        }
-
-        h2 {
-            margin: 0 0 10px 0;
-            font-size: 22px;
-        }
-
-        .meta,
-        .actions,
-        .summary {
-            display: flex;
-            flex-wrap: wrap;
-            gap: 10px;
-            align-items: center;
-        }
-
-        .meta span,
-        .badge {
-            background: #f8fafc;
-            border: 1px solid var(--line);
-            border-radius: 999px;
-            padding: 6px 12px;
-            color: var(--muted);
-            font-size: 13px;
-        }
-
-        .badge {
-            padding: 4px 10px;
-            font-size: 12px;
-        }
-
-        .badge-accent {
-            background: var(--accent-soft);
-            border-color: #d5e3ff;
-            color: var(--accent);
-        }
-
-        .btn,
-        .btn-link {
-            display: inline-flex;
-            align-items: center;
-            justify-content: center;
-            border: 1px solid var(--line-strong);
-            background: #ffffff;
-            color: var(--text);
-            border-radius: 10px;
-            padding: 8px 12px;
-            cursor: pointer;
-            font-size: 14px;
-            text-decoration: none;
-        }
-
-        .btn-primary {
-            background: var(--accent);
-            border-color: var(--accent);
-            color: #ffffff;
-        }
-
-        .btn-danger {
-            border-color: #ef4444;
-            color: #b91c1c;
-        }
-
-        .btn:hover,
-        .btn-link:hover {
-            opacity: 0.9;
-        }
-
-        .message {
-            margin-top: 12px;
-            border: 1px solid #d5e3ff;
-            background: var(--accent-soft);
-            color: var(--accent);
-            border-radius: 12px;
-            padding: 10px 12px;
-            font-size: 14px;
-        }
-
-        .layout {
-            display: grid;
-            grid-template-columns: 420px 1fr;
-            gap: 16px;
-            align-items: start;
-        }
-
-        .field-grid {
-            display: grid;
-            gap: 12px;
-        }
-
-        .field-row {
-            display: grid;
-            grid-template-columns: 1fr 1fr;
-            gap: 12px;
-        }
-
-        .field {
-            display: grid;
-            gap: 6px;
-        }
-
-        label {
-            color: var(--muted);
-            font-size: 13px;
-        }
-
-        input[type="text"],
-        input[type="number"],
-        select,
-        textarea {
-            width: 100%;
-            border: 1px solid var(--line-strong);
-            border-radius: 10px;
-            padding: 10px 12px;
-            font-size: 14px;
-            color: var(--text);
-            background: #ffffff;
-        }
-
-        textarea {
-            min-height: 96px;
-            resize: vertical;
-            font-family: Consolas, "Courier New", monospace;
-            line-height: 1.5;
-        }
-
-        .checkbox {
-            display: flex;
-            align-items: center;
-            gap: 8px;
-        }
-
-        .checkbox input {
-            width: 16px;
-            height: 16px;
-        }
-
-        .hint {
-            color: var(--muted);
-            font-size: 12px;
-            line-height: 1.6;
-        }
-
-        .simple-box {
-            border: 1px solid #d5e3ff;
-            background: #f7fbff;
-            border-radius: 12px;
-            padding: 12px;
-            margin-bottom: 14px;
-        }
-
-        details {
-            border: 1px solid var(--line);
-            border-radius: 12px;
-            padding: 10px 12px;
-            background: #fbfdff;
-        }
-
-        details + details {
-            margin-top: 12px;
-        }
-
-        summary {
-            cursor: pointer;
-            font-weight: 600;
-        }
-
-        table {
-            width: 100%;
-            border-collapse: collapse;
-        }
-
-        th {
-            text-align: left;
-            font-size: 13px;
-            color: var(--muted);
-            border-bottom: 1px solid var(--line);
-            padding: 10px 8px;
-            background: #ffffff;
-        }
-
-        td {
-            font-size: 14px;
-            border-bottom: 1px solid var(--line);
-            padding: 10px 8px;
-            vertical-align: top;
-            background: #ffffff;
-        }
-
-        tr:last-child td {
-            border-bottom: none;
-        }
-
-        .row-actions {
-            display: flex;
-            gap: 8px;
-            flex-wrap: wrap;
-        }
-
-        .inline-form {
-            display: inline-flex;
-        }
-
-        .small {
-            color: var(--muted);
-            font-size: 12px;
-        }
-
-        .empty {
-            color: var(--muted);
-            text-align: center;
-            padding: 28px 10px;
-            font-size: 13px;
-        }
-
-        @media (max-width: 1100px) {
-            .layout {
-                grid-template-columns: 1fr;
-            }
-        }
-
-        @media (max-width: 700px) {
-            .container {
-                margin-top: 14px;
-                padding: 0 10px 18px;
-            }
-
-            h1 {
-                font-size: 28px;
-            }
-
-            .field-row {
-                grid-template-columns: 1fr;
-            }
-        }
-    </style>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>{{ app_name }} - Agent 控制台</title>
+<style>
+*{box-sizing:border-box}
+body{margin:0;background:#f4f7fb;color:#122033;font:14px "Segoe UI","Microsoft YaHei",sans-serif}
+.page{max-width:1400px;margin:0 auto;padding:20px}
+.card{background:#fff;border:1px solid #d9e2ec;border-radius:16px;padding:16px;margin-bottom:16px}
+.top,.row,.actions,.checks{display:flex;gap:10px;flex-wrap:wrap}
+.top{justify-content:space-between;align-items:flex-start}
+.grid{display:grid;grid-template-columns:minmax(320px,380px) minmax(0,1fr);gap:16px;align-items:start}
+.fields{display:grid;gap:12px}
+.fields>*{min-width:0}
+.two{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px;align-items:start}
+.two>*{min-width:0}
+.btn{display:inline-flex;align-items:center;justify-content:center;padding:8px 12px;border:1px solid #b8c5d6;border-radius:10px;background:#fff;color:#122033;text-decoration:none;cursor:pointer}
+.primary{background:#1d4ed8;border-color:#1d4ed8;color:#fff}
+.danger{background:#fff1f1;border-color:#ef4444;color:#b42318}
+.msg{padding:10px 12px;border:1px solid #cfe0ff;background:#eaf2ff;border-radius:12px;margin:16px 0}
+.pill{padding:6px 10px;border:1px solid #d9e2ec;border-radius:999px;background:#fff;color:#5a6b7f}
+.hint{color:#5a6b7f;line-height:1.6}
+.checks{align-items:stretch}
+.checks label,.inline-check{display:flex;align-items:center;gap:8px;width:100%;min-height:44px;padding:10px 12px;border:1px solid #d9e2ec;border-radius:12px;background:#f8fbff;line-height:1.4}
+.fields>.two>label,.fields>label{display:grid;gap:6px;color:#5a6b7f;min-width:0}
+input[type="text"],input[type="number"],input[type="time"],select,textarea{display:block;width:100%;max-width:100%;padding:10px 12px;border:1px solid #b8c5d6;border-radius:10px;background:#fff;color:#122033;font:14px inherit}
+input[type="checkbox"]{width:16px;height:16px;min-width:16px;flex:0 0 16px;margin:0;padding:0}
+textarea{min-height:110px;resize:vertical;font-family:Consolas,"Courier New",monospace}
+.hide{display:none}
+table{width:100%;border-collapse:collapse}
+th,td{padding:10px 8px;border-bottom:1px solid #d9e2ec;text-align:left;vertical-align:top}
+th{font-size:13px;color:#5a6b7f;background:#f8fbff}
+tr.active td{background:#f5f9ff}
+.table{overflow:auto}
+@media (max-width:980px){.grid,.two{grid-template-columns:1fr}}
+</style>
 </head>
 <body>
-<div class="container">
+<div class="page">
+  <div class="card top">
+    <div>
+      <h1 style="margin:0 0 8px">Agent 控制台</h1>
+      <div class="hint">这里只保留任务范围、自动重启和 qiannian UI 设置。资源单独放到资源控制台。</div>
+    </div>
+    <div class="actions">
+      <a class="btn" href="{{ dashboard_url }}">状态看板</a>
+      <a class="btn" href="{{ resources_console_url }}">资源控制台</a>
+    </div>
+  </div>
+  {% if message %}<div class="msg">{{ message }}</div>{% endif %}
+  <div class="row" style="margin-bottom:16px">
+    <span class="pill">Agent: {{ agent_profile_count }}</span>
+    <span class="pill">资源: {{ resource_item_count }}</span>
+    <span class="pill">当前: {{ selected_agent.agent_id or '新建 Agent' }}</span>
+  </div>
+  <div class="grid">
     <div class="card">
-        <h1>{{ app_name }} 配置台</h1>
-        <div class="meta">
-            <span>VM 配置数：{{ agent_profile_count }}</span>
-            <span>资源条目数：{{ resource_item_count }}</span>
-            <span>建议统一 Agent ID：`VM-3-1`、`VM-3-2`</span>
-        </div>
-        {% if message %}
-            <div class="message">{{ message }}</div>
-        {% endif %}
-        <div class="actions" style="margin-top: 12px;">
-            <a class="btn-link" href="{{ dashboard_url }}">返回监控页</a>
-            <a class="btn-link" href="/api/resources/manifest{% if auth_token %}?auth_token={{ auth_token }}{% endif %}" target="_blank">查看 Manifest</a>
-        </div>
+      <div class="top" style="margin-bottom:12px">
+        <h2 style="margin:0">Agent 列表</h2>
+        <form method="get" action="/console"><input type="hidden" name="auth_token" value="{{ auth_token }}"><button class="btn" type="submit">新建空白</button></form>
+      </div>
+      <div class="hint" style="margin-bottom:12px">主页面不再展示资源和 EXE 下载字段，避免日常配置被干扰。</div>
+      <div class="table">
+        <table>
+          <thead><tr><th>Agent</th><th>区服</th><th>组范围</th><th>状态</th><th></th></tr></thead>
+          <tbody>
+          {% for agent in agent_profiles %}
+            <tr class="{% if agent.agent_id == selected_agent.agent_id %}active{% endif %}">
+              <td><strong>{{ agent.agent_id }}</strong><br><span class="hint">{{ agent.updated_at or '-' }}</span></td>
+              <td>{{ agent.region or '-' }}</td>
+              <td>{{ agent.group_start }} -> {{ agent.group_end }}</td>
+              <td>{{ '启用' if agent.enabled else '停用' }} / {{ agent.desired_run_state }}</td>
+              <td><form method="get" action="/console"><input type="hidden" name="auth_token" value="{{ auth_token }}"><input type="hidden" name="edit_agent" value="{{ agent.agent_id }}"><button class="btn" type="submit">编辑</button></form></td>
+            </tr>
+          {% else %}
+            <tr><td colspan="5">还没有 Agent 配置。</td></tr>
+          {% endfor %}
+          </tbody>
+        </table>
+      </div>
     </div>
-
-    <div class="layout">
-        <div class="card">
-            <h2>先填这 4 项</h2>
-            <div class="simple-box">
-                <div class="hint">
-                    先只管这几个字段：`Agent ID`、`区服`、`开始组`、`结束组`。<br />
-                    其他高级参数先不用填，也不影响你先跑通第一版。
-                </div>
+    <div>
+      <div class="card">
+        <h2 style="margin-top:0">{{ selected_agent.agent_id and '编辑 Agent' or '新建 Agent' }}</h2>
+        <form method="post" action="/console/agents/save{{ auth_query_suffix }}">
+          <input type="hidden" name="original_agent_id" value="{{ selected_agent.agent_id }}">
+          <textarea class="hide" name="config_payload_original">{{ selected_agent.config_payload_original }}</textarea>
+          <div class="fields">
+            <div class="two">
+              <label>Agent ID<input type="text" name="agent_id" value="{{ selected_agent.agent_id }}" required></label>
+              <div>
+                <div style="color:#5a6b7f;font-size:13px;margin-bottom:6px">是否启用</div>
+                <label class="inline-check"><input type="checkbox" name="enabled" {% if selected_agent.enabled %}checked{% endif %}>启用任务链路</label>
+              </div>
             </div>
-
-            <form method="post" action="/console/agents/save{{ auth_query_suffix }}">
-                <input type="hidden" name="original_agent_id" value="{{ selected_agent.agent_id }}" />
-                <input type="hidden" name="desired_action" value="{{ selected_agent.desired_action }}" />
-                <input type="hidden" name="action_seq" value="{{ selected_agent.action_seq }}" />
-                <div class="field-grid">
-                    <div class="field">
-                        <label>Agent ID</label>
-                        <input type="text" name="agent_id" value="{{ selected_agent.agent_id }}" placeholder="VM-3-1" required />
-                    </div>
-
-                    <div class="field-row">
-                        <div class="field">
-                            <label>区服</label>
-                            <input type="text" name="region" value="{{ selected_agent.region }}" placeholder="97区" />
-                        </div>
-                        <div class="field checkbox">
-                            <input type="checkbox" name="enabled" {% if selected_agent.enabled %}checked{% endif %} />
-                            <label>启用该 VM 任务</label>
-                        </div>
-                    </div>
-
-                    <div class="field-row">
-                        <div class="field">
-                            <label>开始 Group</label>
-                            <input type="number" name="group_start" value="{{ selected_agent.group_start }}" />
-                        </div>
-                        <div class="field">
-                            <label>结束 Group</label>
-                            <input type="number" name="group_end" value="{{ selected_agent.group_end }}" />
-                        </div>
-                    </div>
-
-                    <div class="field">
-                        <label>备注</label>
-                        <input type="text" name="notes" value="{{ selected_agent.notes }}" placeholder="例如：今天优先跑 97 区" />
-                    </div>
-
-                    <div class="field">
-                        <label>主程序下载地址（可选）</label>
-                        <input type="text" name="exe_url" value="{{ selected_agent.exe_url }}" placeholder="http://192.168.8.102/files/QianNian.zip" />
-                        <div class="hint">如果你后面要让 game_tool 帮你下载或更新主程序，就填这里。</div>
-                    </div>
-                </div>
-
-                <details style="margin-top: 14px;">
-                    <summary>高级参数</summary>
-                    <div class="field-grid" style="margin-top: 12px;">
-                        <div class="field-row">
-                            <div class="field">
-                                <label>任务模式</label>
-                                <input type="text" name="task_mode" value="{{ selected_agent.task_mode }}" placeholder="normal" />
-                            </div>
-                            <div class="field">
-                                <label>优先级</label>
-                                <input type="number" name="priority" value="{{ selected_agent.priority }}" />
-                            </div>
-                        </div>
-
-                        <div class="field-row">
-                            <div class="field">
-                                <label>期望运行状态</label>
-                                <select name="desired_run_state">
-                                    <option value="run" {% if selected_agent.desired_run_state == "run" %}selected{% endif %}>run</option>
-                                    <option value="stop" {% if selected_agent.desired_run_state == "stop" %}selected{% endif %}>stop</option>
-                                </select>
-                            </div>
-                            <div class="field">
-                                <label>每日启动时间</label>
-                                <input type="text" name="schedule_daily_start" value="{{ selected_agent.schedule_daily_start }}" placeholder="00:00" />
-                                <div class="hint">留空表示不做每日定时启动。</div>
-                            </div>
-                        </div>
-
-                        <div class="field-row">
-                            <div class="field checkbox">
-                                <input type="checkbox" name="auto_restart_on_stale" {% if selected_agent.auto_restart_on_stale %}checked{% endif %} />
-                                <label>上报 stale 时允许自动重启</label>
-                            </div>
-                            <div class="field">
-                                <label>启动宽限秒数</label>
-                                <input type="number" name="startup_grace_seconds" value="{{ selected_agent.startup_grace_seconds }}" />
-                            </div>
-                        </div>
-
-                        <div class="field-row">
-                            <div class="field">
-                                <label>重启冷却秒数</label>
-                                <input type="number" name="restart_cooldown_seconds" value="{{ selected_agent.restart_cooldown_seconds }}" />
-                            </div>
-                            <div class="field">
-                                <label>每日最多重启次数</label>
-                                <input type="number" name="max_restart_per_day" value="{{ selected_agent.max_restart_per_day }}" />
-                            </div>
-                        </div>
-
-                        <div class="field-row">
-                            <div class="field">
-                                <label>配置版本</label>
-                                <input type="text" name="profile_version" value="{{ selected_agent.profile_version }}" placeholder="留空则自动使用当前时间" />
-                            </div>
-                            <div class="field">
-                                <label>脚本配置版本</label>
-                                <input type="text" name="config_version" value="{{ selected_agent.config_version }}" placeholder="2026-03-09-01" />
-                            </div>
-                        </div>
-
-                        <div class="field-row">
-                            <div class="field">
-                                <label>资源清单版本</label>
-                                <input type="text" name="resource_manifest_version" value="{{ selected_agent.resource_manifest_version }}" placeholder="2026-03-09-manifest" />
-                            </div>
-                            <div class="field">
-                                <label>脚本入口</label>
-                                <input type="text" name="script_entry" value="{{ selected_agent.script_entry }}" placeholder="main.lua / task.json" />
-                            </div>
-                        </div>
-
-                        <div class="field-row">
-                            <div class="field">
-                                <label>启动 EXE</label>
-                                <input type="text" name="startup_exe" value="{{ selected_agent.startup_exe }}" placeholder="QianNian.exe" />
-                            </div>
-                            <div class="field">
-                                <label>启动参数</label>
-                                <input type="text" name="startup_args" value="{{ selected_agent.startup_args }}" placeholder="--mode auto" />
-                            </div>
-                        </div>
-
-                        <div class="field-row">
-                            <div class="field">
-                                <label>EXE 版本</label>
-                                <input type="text" name="exe_version" value="{{ selected_agent.exe_version }}" placeholder="1.0.0" />
-                            </div>
-                            <div class="field">
-                                <label>EXE SHA256</label>
-                                <input type="text" name="exe_sha256" value="{{ selected_agent.exe_sha256 }}" placeholder="可选" />
-                            </div>
-                        </div>
-
-                        <div class="field">
-                            <label>脚本配置内容</label>
-                            <textarea name="config_payload" placeholder='建议填 JSON，例如 {"region":"97区","group_start":32,"group_end":80}'>{{ selected_agent.config_payload }}</textarea>
-                            <div class="hint">checktool 可以直接拿这段内容写到本地配置文件里。</div>
-                        </div>
-                    </div>
-                </details>
-
-                <div class="actions" style="margin-top: 14px;">
-                    <button class="btn btn-primary" type="submit">保存 VM 配置</button>
-                    <a class="btn-link" href="/console{{ auth_query_suffix }}">新建空白</a>
-                    {% if selected_agent.agent_id %}
-                        <a class="btn-link" href="/api/bootstrap?agent_id={{ selected_agent.agent_id }}{% if auth_token %}&auth_token={{ auth_token }}{% endif %}" target="_blank">预览 Bootstrap</a>
-                    {% endif %}
-                </div>
-            </form>
-
-            {% if selected_agent.agent_id %}
-            <div class="actions" style="margin-top: 10px;">
-                <form class="inline-form" method="post" action="/console/agents/action{{ auth_query_suffix }}">
-                    <input type="hidden" name="agent_id" value="{{ selected_agent.agent_id }}" />
-                    <input type="hidden" name="action" value="start_once" />
-                    <button class="btn" type="submit">启动一次</button>
-                </form>
-                <form class="inline-form" method="post" action="/console/agents/action{{ auth_query_suffix }}">
-                    <input type="hidden" name="agent_id" value="{{ selected_agent.agent_id }}" />
-                    <input type="hidden" name="action" value="restart_once" />
-                    <button class="btn" type="submit">重启一次</button>
-                </form>
-                <form class="inline-form" method="post" action="/console/agents/action{{ auth_query_suffix }}">
-                    <input type="hidden" name="agent_id" value="{{ selected_agent.agent_id }}" />
-                    <input type="hidden" name="action" value="sync_once" />
-                    <button class="btn" type="submit">只同步一次</button>
-                </form>
+            <div class="two">
+              <label>区服<input type="text" name="region" value="{{ selected_agent.region }}" placeholder="例如 103 或 97区"></label>
+              <label>运行状态<select name="desired_run_state"><option value="run" {% if selected_agent.desired_run_state == 'run' %}selected{% endif %}>run</option><option value="stop" {% if selected_agent.desired_run_state == 'stop' %}selected{% endif %}>stop</option></select></label>
             </div>
-            {% endif %}
-
-            <details style="margin-top: 14px;">
-                <summary>资源管理（后面再用）</summary>
-                <div class="hint" style="margin-top: 10px;">这一块用于下发 `gamebase`、`offset`、图片包、配置文件。你现在可以先不管。</div>
-                <form method="post" action="/console/resources/save{{ auth_query_suffix }}" style="margin-top: 12px;">
-                    <input type="hidden" name="resource_id" value="{{ selected_resource.id }}" />
-                    <div class="field-grid">
-                        <div class="field-row">
-                            <div class="field">
-                                <label>资源名称</label>
-                                <input type="text" name="name" value="{{ selected_resource.name }}" placeholder="gamebase.json" />
-                            </div>
-                            <div class="field checkbox">
-                                <input type="checkbox" name="enabled" {% if selected_resource.enabled %}checked{% endif %} />
-                                <label>启用该资源</label>
-                            </div>
-                        </div>
-                        <div class="field-row">
-                            <div class="field">
-                                <label>资源类型</label>
-                                <input type="text" name="kind" value="{{ selected_resource.kind }}" placeholder="config / offset / image_pack" />
-                            </div>
-                            <div class="field">
-                                <label>资源版本</label>
-                                <input type="text" name="version" value="{{ selected_resource.version }}" placeholder="2026-03-09-01" />
-                            </div>
-                        </div>
-                        <div class="field">
-                            <label>目标路径</label>
-                            <input type="text" name="target_path" value="{{ selected_resource.target_path }}" placeholder="runtime/gamebase.json" />
-                        </div>
-                        <div class="field">
-                            <label>下载地址</label>
-                            <input type="text" name="url" value="{{ selected_resource.url }}" placeholder="http://192.168.8.102/files/gamebase.json" />
-                        </div>
-                        <div class="field-row">
-                            <div class="field">
-                                <label>SHA256</label>
-                                <input type="text" name="sha256" value="{{ selected_resource.sha256 }}" />
-                            </div>
-                            <div class="field">
-                                <label>大小（字节）</label>
-                                <input type="number" name="size_bytes" value="{{ selected_resource.size_bytes }}" />
-                            </div>
-                        </div>
-                        <div class="field">
-                            <label>指定 Agent</label>
-                            <input type="text" name="target_agents" value="{{ selected_resource.target_agents }}" placeholder="留空表示全部；多个用逗号分隔" />
-                        </div>
-                        <div class="field">
-                            <label>备注</label>
-                            <input type="text" name="notes" value="{{ selected_resource.notes }}" placeholder="例如：仅 VM-3-1 使用" />
-                        </div>
-                    </div>
-                    <div class="actions" style="margin-top: 14px;">
-                        <button class="btn" type="submit">保存资源</button>
-                    </div>
-                </form>
-            </details>
-        </div>
-
-        <div class="card">
-            <div class="actions" style="justify-content: space-between; margin-bottom: 12px;">
-                <div>
-                    <h2>现有 VM 配置</h2>
-                    <div class="small">第一版只要维护这里就够了。</div>
-                </div>
-                <div class="summary">
-                    <span class="badge badge-accent">????</span>
-                    <span class="badge">????</span>
-                </div>
+            <div class="two">
+              <label>起始组<input type="number" name="group_start" value="{{ selected_agent.group_start }}" min="0"></label>
+              <label>结束组<input type="number" name="group_end" value="{{ selected_agent.group_end }}" min="0"></label>
             </div>
-
-            <table>
-                <thead>
-                <tr>
-                    <th>Agent</th>
-                    <th>任务</th>
-                    <th>版本</th>
-                    <th>操作</th>
-                </tr>
-                </thead>
-                <tbody>
-                {% if agent_profiles %}
-                    {% for item in agent_profiles %}
-                        <tr>
-                            <td>
-                                {{ item.agent_id }}
-                                <div class="small">{% if item.enabled %}启用{% else %}停用{% endif %}</div>
-                            </td>
-                            <td>
-                                {{ item.region or "-" }}
-                                <div class="small">Group {{ item.group_start }} - {{ item.group_end }}</div>
-                                <div class="small">{{ item.notes or "-" }}</div>
-                                <div class="small">控制: {{ item.desired_run_state }} / {{ item.schedule_daily_start or "未定时" }}</div>
-                            </td>
-                            <td>
-                                {{ item.profile_version or "-" }}
-                                <div class="small">脚本：{{ item.config_version or "-" }}</div>
-                                <div class="small">资源：{{ item.resource_manifest_version or "-" }}</div>
-                                <div class="small">下载：{% if item.exe_url %}已填写{% else %}未填写{% endif %}</div>
-                                <div class="small">重启：{% if item.auto_restart_on_stale %}自动{% else %}手动{% endif %} / {{ item.restart_cooldown_seconds }}s / {{ item.max_restart_per_day }}次</div>
-                            </td>
-                            <td>
-                                <div class="row-actions">
-                                    <form class="inline-form" method="get" action="/console">
-                                        <input type="hidden" name="edit_agent" value="{{ item.agent_id }}" />
-                                        {% if auth_token %}<input type="hidden" name="auth_token" value="{{ auth_token }}" />{% endif %}
-                                        <button class="btn" type="submit">编辑</button>
-                                    </form>
-                                    <a class="btn-link" href="/api/bootstrap?agent_id={{ item.agent_id }}{% if auth_token %}&auth_token={{ auth_token }}{% endif %}" target="_blank">预览</a>
-                                    <form class="inline-form" method="post" action="/console/agents/delete{{ auth_query_suffix }}" onsubmit="return confirm('确认删除 {{ item.agent_id }} 的配置吗？');">
-                                        <input type="hidden" name="agent_id" value="{{ item.agent_id }}" />
-                                        <button class="btn btn-danger" type="submit">删除</button>
-                                    </form>
-                                </div>
-                            </td>
-                        </tr>
-                    {% endfor %}
-                {% else %}
-                    <tr>
-                        <td colspan="4" class="empty">还没有 VM 配置。先录入 `VM-3-1`、区服、开始组、结束组，再点保存。</td>
-                    </tr>
-                {% endif %}
-                </tbody>
-            </table>
-        </div>
+            <div class="two">
+              <label>每日启动时间<input type="time" name="schedule_daily_start" value="{{ selected_agent.schedule_daily_start }}"></label>
+              <div>
+                <div style="color:#5a6b7f;font-size:13px;margin-bottom:6px">自动重启</div>
+                <label class="inline-check"><input type="checkbox" name="auto_restart_on_stale" {% if selected_agent.auto_restart_on_stale %}checked{% endif %}>上报超时自动恢复</label>
+              </div>
+            </div>
+            <div class="two">
+              <label>启动宽限秒数<input type="number" name="startup_grace_seconds" value="{{ selected_agent.startup_grace_seconds }}" min="0"></label>
+              <label>重启冷却秒数<input type="number" name="restart_cooldown_seconds" value="{{ selected_agent.restart_cooldown_seconds }}" min="0"></label>
+            </div>
+            <div class="two">
+              <label>每日最大重启次数<input type="number" name="max_restart_per_day" value="{{ selected_agent.max_restart_per_day }}" min="0"></label>
+              <label>备注<input type="text" name="notes" value="{{ selected_agent.notes }}"></label>
+            </div>
+          </div>
+          <div class="card" style="margin:16px 0 0;padding:14px;box-shadow:none">
+            <h3 style="margin:0 0 8px">qiannian UI 设置</h3>
+            <div class="hint" style="margin-bottom:12px">这里控制 game_tool 启动后如何填写 qiannian 的控件。常用项直接勾选，不再手写整段 JSON。</div>
+            <div class="fields">
+              <div class="two">
+                <label>启动后按钮<select name="ui_launch_button"><option value="" {% if not selected_agent.ui_launch_button %}selected{% endif %}>跟随 game_tool 默认</option><option value="none" {% if selected_agent.ui_launch_button == 'none' %}selected{% endif %}>none 不点任务按钮</option><option value="gongzi" {% if selected_agent.ui_launch_button == 'gongzi' %}selected{% endif %}>gongzi</option><option value="runtask" {% if selected_agent.ui_launch_button == 'runtask' %}selected{% endif %}>runtask</option><option value="start" {% if selected_agent.ui_launch_button == 'start' %}selected{% endif %}>start</option></select></label>
+                <label>角色索引 selorder<input type="number" name="ui_role_index" value="{{ selected_agent.ui_role_index }}" min="0"></label>
+              </div>
+              <div class="checks">
+                <label><input type="checkbox" name="ui_checkbox_trade_setting" {% if selected_agent.ui_checkbox_trade_setting %}checked{% endif %}>trade_setting</label>
+                <label><input type="checkbox" name="ui_checkbox_gumu_exit" {% if selected_agent.ui_checkbox_gumu_exit %}checked{% endif %}>gumu_exit</label>
+                <label><input type="checkbox" name="ui_checkbox_log_file" {% if selected_agent.ui_checkbox_log_file %}checked{% endif %}>log_file</label>
+                <label><input type="checkbox" name="ui_checkbox_log_detail" {% if selected_agent.ui_checkbox_log_detail %}checked{% endif %}>log_detail</label>
+              </div>
+            </div>
+          </div>
+          <details style="margin-top:16px"><summary>高级 JSON 扩展</summary><div class="hint" style="margin:8px 0">这里只放还没表单化的少量字段。不要再写 region、group_start、group_end。</div><textarea name="config_payload_extra">{{ selected_agent.config_payload_extra }}</textarea></details>
+          <div class="actions" style="margin-top:16px"><button class="btn primary" type="submit">保存 Agent 配置</button></div>
+        </form>
+      </div>
+      {% if selected_agent.agent_id %}
+      <div class="card">
+        <h3 style="margin-top:0">删除当前 Agent</h3>
+        <div class="hint" style="margin-bottom:12px">删除只移除这条 Agent 配置，不影响已同步到 VM 本地的缓存文件。</div>
+        <form method="post" action="/console/agents/delete{{ auth_query_suffix }}" onsubmit="return confirm('确认删除当前 Agent 配置吗？');"><input type="hidden" name="agent_id" value="{{ selected_agent.agent_id }}"><button class="btn danger" type="submit">删除 {{ selected_agent.agent_id }}</button></form>
+      </div>
+      {% endif %}
     </div>
+  </div>
 </div>
 </body>
 </html>

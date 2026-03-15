@@ -1,4 +1,4 @@
-﻿import asyncio
+import asyncio
 import datetime as dt
 import json
 import logging
@@ -155,6 +155,18 @@ class ReportPayload(BaseModel):
     ts: Optional[str] = None
 
 
+class RecoveryPayload(BaseModel):
+    agent_id: str = Field(min_length=1, max_length=128)
+    reason: str = Field(default="restart")
+    region: str = Field(default="")
+    current_group: int = 0
+    finished_group: int = 0
+    next_group: int = 0
+    role_index: int = 0
+    hold_seconds: int = 0
+    ts: Optional[str] = None
+
+
 class RemoveAgentPayload(BaseModel):
     agent_id: str = Field(min_length=1, max_length=128)
 
@@ -166,6 +178,8 @@ state_lock = threading.Lock()
 agent_states: Dict[str, Dict[str, Any]] = {}
 history_cache: deque = deque(maxlen=2000)
 stale_state: Dict[str, bool] = {}
+completed_state: Dict[str, bool] = {}
+completed_notice_sent: Dict[str, bool] = {}
 last_alert_sent_at: Dict[str, float] = {}
 alert_stale_started_at: Dict[str, float] = {}
 alert_sent_count: Dict[str, int] = {}
@@ -177,6 +191,13 @@ alert_task: Optional[asyncio.Task] = None
 
 def now_str() -> str:
     return dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def today_str() -> str:
+    return dt.datetime.now().strftime("%Y-%m-%d")
+
+
+current_runtime_day = today_str()
 
 
 def extract_region_number(region_text: Any) -> Optional[int]:
@@ -459,6 +480,138 @@ def parse_json_payload(raw_text: str) -> Any:
         return None
 
 
+QIANNIAN_UI_LAUNCH_BUTTONS = {"", "gongzi", "runtask", "start", "none"}
+DEFAULT_COMPLETE_ROLE_INDEX = 5
+QIANNIAN_UI_CHECKBOX_KEYS = (
+    "trade_setting",
+    "gumu_exit",
+    "log_file",
+    "log_detail",
+)
+QIANNIAN_UI_LEGACY_TOP_LEVEL_KEYS = {
+    "region",
+    "group_start",
+    "group_end",
+    "start_group",
+    "current_group",
+    "group_id",
+    "max_group",
+    "max_group_id",
+    "selorder",
+    "role_index",
+    "start_role_index",
+    "launch_button",
+    "checkboxes",
+}
+
+
+def normalize_launch_button(value: Any) -> str:
+    text = str(value or "").strip().lower()
+    if text in QIANNIAN_UI_LAUNCH_BUTTONS:
+        return text
+    return ""
+
+
+def extract_qiannian_ui_settings(raw_text: str) -> Dict[str, Any]:
+    defaults = {
+        "ui_launch_button": "",
+        "ui_role_index": 0,
+        "ui_checkbox_trade_setting": False,
+        "ui_checkbox_gumu_exit": False,
+        "ui_checkbox_log_file": False,
+        "ui_checkbox_log_detail": False,
+        "config_payload_extra": "",
+    }
+    payload = parse_json_payload(raw_text)
+    if not isinstance(payload, dict):
+        return defaults
+
+    payload_copy = dict(payload)
+    nested = payload_copy.pop("qiannian_ui", None)
+    ui_payload = dict(nested) if isinstance(nested, dict) else {}
+
+    if "launch_button" not in ui_payload and "launch_button" in payload_copy:
+        ui_payload["launch_button"] = payload_copy.pop("launch_button")
+
+    if "checkboxes" not in ui_payload and isinstance(payload_copy.get("checkboxes"), dict):
+        ui_payload["checkboxes"] = payload_copy.pop("checkboxes")
+
+    role_index_value = 0
+    for key in ("role_index", "selorder", "start_role_index"):
+        if key in ui_payload:
+            role_index_value = parse_int(ui_payload.get(key), 0)
+            break
+        if key in payload_copy:
+            role_index_value = parse_int(payload_copy.pop(key), 0)
+            break
+
+    for legacy_key in QIANNIAN_UI_LEGACY_TOP_LEVEL_KEYS:
+        payload_copy.pop(legacy_key, None)
+
+    checkbox_values = ui_payload.get("checkboxes", {})
+    if not isinstance(checkbox_values, dict):
+        checkbox_values = {}
+
+    defaults["ui_launch_button"] = normalize_launch_button(ui_payload.get("launch_button", ""))
+    defaults["ui_role_index"] = role_index_value
+    for key in QIANNIAN_UI_CHECKBOX_KEYS:
+        defaults[f"ui_checkbox_{key}"] = bool(checkbox_values.get(key, False))
+
+    if payload_copy:
+        defaults["config_payload_extra"] = json.dumps(payload_copy, ensure_ascii=False, indent=2)
+    return defaults
+
+
+def attach_qiannian_ui_settings(profile: Dict[str, Any]) -> Dict[str, Any]:
+    profile.update(extract_qiannian_ui_settings(str(profile.get("config_payload", ""))))
+    profile["config_payload_original"] = str(profile.get("config_payload", ""))
+    return profile
+
+
+def build_config_payload_text(form: Dict[str, str], original_raw: str) -> str:
+    original_payload = parse_json_payload(original_raw)
+    if not isinstance(original_payload, dict):
+        original_payload = {}
+
+    existing_ui_payload = original_payload.get("qiannian_ui")
+    if not isinstance(existing_ui_payload, dict):
+        existing_ui_payload = {}
+
+    extra_raw = str(form.get("config_payload_extra", "")).strip()
+    if extra_raw:
+        extra_payload = parse_json_payload(extra_raw)
+        if not isinstance(extra_payload, dict):
+            raise ValueError("?? JSON ???????? JSON ??")
+    else:
+        extra_payload = {}
+
+    ui_payload = {
+        key: value
+        for key, value in existing_ui_payload.items()
+        if key not in {"launch_button", "role_index", "selorder", "start_role_index", "checkboxes"}
+    }
+
+    launch_button = normalize_launch_button(form.get("ui_launch_button", ""))
+    if launch_button:
+        ui_payload["launch_button"] = launch_button
+
+    role_index_text = str(form.get("ui_role_index", "")).strip()
+    if role_index_text:
+        ui_payload["selorder"] = max(0, parse_int(role_index_text, 0))
+
+    checkbox_values = {
+        key: form.get(f"ui_checkbox_{key}") == "on"
+        for key in QIANNIAN_UI_CHECKBOX_KEYS
+    }
+    ui_payload["checkboxes"] = checkbox_values
+
+    payload: Dict[str, Any] = dict(extra_payload)
+    if ui_payload:
+        payload["qiannian_ui"] = ui_payload
+
+    return json.dumps(payload, ensure_ascii=False, indent=2) if payload else ""
+
+
 async def parse_request_form_data(request: Request) -> Dict[str, str]:
     body = await request.body()
     if not body:
@@ -489,9 +642,10 @@ def build_console_redirect_url(
     message: Optional[str] = None,
     edit_agent: Optional[str] = None,
     edit_resource_id: Optional[int] = None,
+    console_path: str = "/console",
 ) -> str:
     return append_query_params(
-        "/console",
+        console_path,
         auth_token=auth_token,
         message=message,
         edit_agent=edit_agent,
@@ -542,6 +696,52 @@ def ensure_table_columns(table_name: str, column_defs: Dict[str, str]) -> None:
         db_conn.execute(f"ALTER TABLE {table_name} ADD COLUMN {column_name} {definition}")
 
 
+def get_agent_complete_role_index(agent_profile: Optional[Dict[str, Any]]) -> int:
+    if not agent_profile:
+        return DEFAULT_COMPLETE_ROLE_INDEX
+
+    payload = parse_json_payload(str(agent_profile.get("config_payload", "")))
+    if isinstance(payload, dict):
+        for key in ("complete_role_index", "completed_role_index", "max_role_index"):
+            if key in payload:
+                return max(0, parse_int(payload.get(key), DEFAULT_COMPLETE_ROLE_INDEX))
+    return DEFAULT_COMPLETE_ROLE_INDEX
+
+
+def get_completion_state(
+    agent_profile: Optional[Dict[str, Any]],
+    report_item: Optional[Dict[str, Any]],
+) -> Dict[str, Any]:
+    group_end = max(0, parse_int((agent_profile or {}).get("group_end"), 0))
+    complete_role_index = get_agent_complete_role_index(agent_profile)
+    if not report_item:
+        return {
+            "completed": False,
+            "target_group_end": group_end,
+            "complete_role_index": complete_role_index,
+            "completion_basis": "no_report",
+        }
+
+    current_group = max(
+        parse_int(report_item.get("current_group"), 0),
+        parse_int(report_item.get("finished_group"), 0),
+    )
+    role_index = max(0, parse_int(report_item.get("role_index"), 0))
+    event = str(report_item.get("event", "") or "")
+    completed = (
+        group_end > 0
+        and current_group >= group_end
+        and role_index >= complete_role_index
+        and not event.startswith("recovering:")
+    )
+    return {
+        "completed": completed,
+        "target_group_end": group_end,
+        "complete_role_index": complete_role_index,
+        "completion_basis": f"group>={group_end},role_index>={complete_role_index}",
+    }
+
+
 def build_agent_control(agent_profile: Dict[str, Any]) -> Dict[str, Any]:
     return {
         "desired_run_state": normalize_desired_run_state(
@@ -562,6 +762,7 @@ def build_agent_control(agent_profile: Dict[str, Any]) -> Dict[str, Any]:
         "startup_grace_seconds": max(
             0, parse_int(agent_profile.get("startup_grace_seconds"), 300)
         ),
+        "complete_role_index": get_agent_complete_role_index(agent_profile),
         "desired_action": normalize_desired_action(
             agent_profile.get("desired_action", "")
         ),
@@ -569,11 +770,43 @@ def build_agent_control(agent_profile: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+def ensure_runtime_state_for_today() -> None:
+    global current_runtime_day
+    today = today_str()
+    if current_runtime_day == today:
+        return
+
+    with state_lock:
+        if current_runtime_day == today:
+            return
+        agent_count = len(agent_states)
+        history_count = len(history_cache)
+        agent_states.clear()
+        history_cache.clear()
+        stale_state.clear()
+        completed_state.clear()
+        completed_notice_sent.clear()
+        last_alert_sent_at.clear()
+        alert_stale_started_at.clear()
+        alert_sent_count.clear()
+        logger.info(
+            "runtime state rolled to new day: %s -> %s, cleared agents=%s history=%s",
+            current_runtime_day,
+            today,
+            agent_count,
+            history_count,
+        )
+        current_runtime_day = today
+
+
 def build_agent_runtime_snapshot(agent_id: str) -> Dict[str, Any]:
+    ensure_runtime_state_for_today()
     now_ts = time.time()
+    agent_profile = get_agent_profile(agent_id)
     with state_lock:
         item = dict(agent_states.get(agent_id, {}))
 
+    completion_state = get_completion_state(agent_profile, item if item else None)
     if not item:
         return {
             "has_report": False,
@@ -587,13 +820,18 @@ def build_agent_runtime_snapshot(agent_id: str) -> Dict[str, Any]:
             "next_group": 0,
             "role_index": 0,
             "event": "",
+            "completed": completion_state["completed"],
+            "target_group_end": completion_state["target_group_end"],
+            "complete_role_index": completion_state["complete_role_index"],
+            "completion_basis": completion_state["completion_basis"],
         }
 
     elapsed = int(max(0, now_ts - float(item.get("server_epoch", 0))))
+    stale = False if completion_state["completed"] else elapsed > settings.alert_timeout_seconds
     return {
         "has_report": True,
         "report_timeout_seconds": settings.alert_timeout_seconds,
-        "stale": elapsed > settings.alert_timeout_seconds,
+        "stale": stale,
         "elapsed": elapsed,
         "server_time": item.get("server_time", ""),
         "server_epoch": item.get("server_epoch", 0),
@@ -602,11 +840,15 @@ def build_agent_runtime_snapshot(agent_id: str) -> Dict[str, Any]:
         "next_group": item.get("next_group", 0),
         "role_index": item.get("role_index", 0),
         "event": item.get("event", ""),
+        "completed": completion_state["completed"],
+        "target_group_end": completion_state["target_group_end"],
+        "complete_role_index": completion_state["complete_role_index"],
+        "completion_basis": completion_state["completion_basis"],
     }
 
 
 def blank_agent_profile() -> Dict[str, Any]:
-    return {
+    return attach_qiannian_ui_settings({
         "agent_id": "",
         "enabled": True,
         "region": "",
@@ -635,7 +877,7 @@ def blank_agent_profile() -> Dict[str, Any]:
         "action_seq": 0,
         "updated_at": "",
         "updated_epoch": 0,
-    }
+    })
 
 
 def blank_resource_item() -> Dict[str, Any]:
@@ -657,7 +899,7 @@ def blank_resource_item() -> Dict[str, Any]:
 
 
 def row_to_agent_profile(row: sqlite3.Row) -> Dict[str, Any]:
-    return {
+    return attach_qiannian_ui_settings({
         "agent_id": row["agent_id"],
         "enabled": bool(row["enabled"]),
         "region": row["region"] or "",
@@ -712,7 +954,7 @@ def row_to_agent_profile(row: sqlite3.Row) -> Dict[str, Any]:
         ),
         "updated_at": row["updated_at"],
         "updated_epoch": row["updated_epoch"],
-    }
+    })
 
 
 def row_to_resource_item(row: sqlite3.Row) -> Dict[str, Any]:
@@ -1124,14 +1366,18 @@ def get_region_stats() -> Dict[str, Any]:
 
 
 def build_rows() -> List[Dict[str, Any]]:
+    ensure_runtime_state_for_today()
     now_ts = time.time()
     with state_lock:
         values = list(agent_states.values())
+    profiles = {profile["agent_id"]: profile for profile in list_agent_profiles()}
 
     rows: List[Dict[str, Any]] = []
     for item in values:
         elapsed = int(max(0, now_ts - item["server_epoch"]))
-        stale = elapsed > settings.alert_timeout_seconds
+        agent_profile = profiles.get(str(item.get("agent_id", "")))
+        completion_state = get_completion_state(agent_profile, item)
+        stale = False if completion_state["completed"] else elapsed > settings.alert_timeout_seconds
         region = item["region"]
         region_number = extract_region_number(region)
         rows.append(
@@ -1148,6 +1394,10 @@ def build_rows() -> List[Dict[str, Any]]:
                 "server_time": item["server_time"],
                 "elapsed": elapsed,
                 "stale": stale,
+                "completed": completion_state["completed"],
+                "target_group_end": completion_state["target_group_end"],
+                "complete_role_index": completion_state["complete_role_index"],
+                "completion_basis": completion_state["completion_basis"],
             }
         )
 
@@ -1242,25 +1492,45 @@ async def post_wecom_markdown(content: str) -> bool:
     return await asyncio.to_thread(post_wecom_markdown_sync, content)
 
 
+def pick_report_time_text(item: Dict[str, Any]) -> str:
+    return str(item.get("server_time") or item.get("client_ts") or "-")
+
+
+
 def build_timeout_markdown(item: Dict[str, Any], elapsed: int) -> str:
+    report_time = pick_report_time_text(item)
     return (
         f"[{item['agent_id']} 上报超时告警]\n"
         f"- 区服: `{item['region']}`\n"
         f"- 当前执行组: `{item['current_group']}`\n"
         f"- 当前角色: `{item['role_index']}`\n"
-        f"- 最后上报时间: `{item['server_time']}`\n"
+        f"- 最后上报时间: {report_time}\n"
         f"- 距今秒数: `{elapsed}`\n"
     )
 
 
+
 def build_recover_markdown(item: Dict[str, Any], elapsed: int) -> str:
+    report_time = pick_report_time_text(item)
     return (
         f"[{item['agent_id']} 上报恢复通知]\n"
         f"- 区服: `{item['region']}`\n"
         f"- 当前执行组: `{item['current_group']}`\n"
         f"- 当前角色: `{item['role_index']}`\n"
-        f"- 最新上报时间: `{item['server_time']}`\n"
+        f"- 最新上报时间: {report_time}\n"
         f"- 当前距今秒数: `{elapsed}`\n"
+    )
+
+
+
+def build_completed_markdown(item: Dict[str, Any]) -> str:
+    report_time = pick_report_time_text(item)
+    return (
+        f"[{item['agent_id']} 已完成预定任务]\n"
+        f"- 区服: `{item['region']}`\n"
+        f"- 当前执行组: `{item['current_group']}` / 目标结束组: `{item['target_group_end']}`\n"
+        f"- 当前角色索引: `{item['role_index']}` / 完成阈值: `{item['complete_role_index']}`\n"
+        f"- 最新上报时间: {report_time}\n"
     )
 
 
@@ -1279,6 +1549,7 @@ def get_alert_cooldown_seconds(agent_id: str, now_ts: float) -> int:
 
 
 async def check_alerts_once() -> None:
+    ensure_runtime_state_for_today()
     if not settings.alert_enabled:
         return
 
@@ -1290,8 +1561,26 @@ async def check_alerts_once() -> None:
         agent_id = row["agent_id"]
         elapsed = row["elapsed"]
         is_stale = row["stale"]
+        is_completed = bool(row.get("completed", False))
         stale_snapshot[agent_id] = is_stale
         prev_stale = stale_state.get(agent_id, False)
+        prev_completed = completed_state.get(agent_id, False)
+
+        if is_completed:
+            if not completed_notice_sent.get(agent_id, False):
+                ok = await post_wecom_markdown(build_completed_markdown(row))
+                if ok:
+                    completed_notice_sent[agent_id] = True
+                    logger.info("completed alert sent: agent=%s", agent_id)
+            completed_state[agent_id] = True
+            stale_state[agent_id] = False
+            alert_stale_started_at.pop(agent_id, None)
+            alert_sent_count.pop(agent_id, None)
+            last_alert_sent_at.pop(agent_id, None)
+            continue
+
+        if prev_completed:
+            completed_state[agent_id] = False
 
         if is_stale:
             if not prev_stale:
@@ -1330,6 +1619,8 @@ async def check_alerts_once() -> None:
     for key in stale_keys:
         if key not in active_ids:
             stale_state.pop(key, None)
+            completed_state.pop(key, None)
+            completed_notice_sent.pop(key, None)
             last_alert_sent_at.pop(key, None)
             alert_stale_started_at.pop(key, None)
             alert_sent_count.pop(key, None)
@@ -1432,7 +1723,35 @@ async def config_console(
             "selected_agent": selected_agent,
             "selected_resource": selected_resource,
             "dashboard_url": append_query_params("/", auth_token=auth_token),
+            "resources_console_url": append_query_params("/console/resources", auth_token=auth_token),
             "agent_profile_count": len(agent_profiles),
+            "resource_item_count": len(resource_items),
+        },
+    )
+
+
+@app.get("/console/resources")
+async def console_resources(
+    request: Request,
+    auth_token: Optional[str] = Query(default=None),
+    edit_resource_id: int = Query(default=0),
+    message: str = Query(default=""),
+) -> HTMLResponse:
+    ensure_auth(None, auth_token)
+    resource_items = list_resource_items()
+    selected_resource = get_resource_item(edit_resource_id) or blank_resource_item()
+    return templates.TemplateResponse(
+        "resources_console.html",
+        {
+            "request": request,
+            "app_name": settings.app_name,
+            "auth_token": auth_token or "",
+            "auth_query_suffix": append_query_params("", auth_token=auth_token),
+            "message": message,
+            "resource_items": resource_items,
+            "selected_resource": selected_resource,
+            "dashboard_url": append_query_params("/", auth_token=auth_token),
+            "main_console_url": append_query_params("/console", auth_token=auth_token),
             "resource_item_count": len(resource_items),
         },
     )
@@ -1449,61 +1768,113 @@ async def console_agent_save(
     agent_id = str(form.get("agent_id", "")).strip()
     if not agent_id:
         return RedirectResponse(
-            build_console_redirect_url(auth_token, "Agent ID 不能为空"),
+            build_console_redirect_url(auth_token, "Agent ID ????"),
+            status_code=303,
+        )
+
+    original_agent_id = str(form.get("original_agent_id", "")).strip() or None
+    existing_agent = get_agent_profile(original_agent_id or agent_id) or blank_agent_profile()
+
+    try:
+        config_payload_text = build_config_payload_text(
+            form,
+            str(
+                form.get(
+                    "config_payload_original",
+                    existing_agent.get("config_payload_original", existing_agent.get("config_payload", "")),
+                )
+            ),
+        )
+    except ValueError as exc:
+        return RedirectResponse(
+            build_console_redirect_url(
+                auth_token,
+                str(exc),
+                edit_agent=original_agent_id or agent_id,
+            ),
             status_code=303,
         )
 
     profile = {
         "agent_id": agent_id,
         "enabled": form.get("enabled") == "on",
-        "region": str(form.get("region", "")).strip(),
-        "group_start": parse_int(form.get("group_start"), 0),
-        "group_end": parse_int(form.get("group_end"), 0),
-        "task_mode": str(form.get("task_mode", "normal")).strip() or "normal",
-        "priority": parse_int(form.get("priority"), 0),
-        "profile_version": str(form.get("profile_version", "")).strip(),
-        "config_version": str(form.get("config_version", "")).strip(),
-        "config_payload": str(form.get("config_payload", "")),
-        "exe_version": str(form.get("exe_version", "")).strip(),
-        "exe_url": str(form.get("exe_url", "")).strip(),
-        "exe_sha256": str(form.get("exe_sha256", "")).strip(),
-        "startup_exe": str(form.get("startup_exe", "QianNian.exe")).strip()
+        "region": str(form.get("region", existing_agent.get("region", ""))).strip(),
+        "group_start": parse_int(form.get("group_start", existing_agent.get("group_start", 0)), 0),
+        "group_end": parse_int(form.get("group_end", existing_agent.get("group_end", 0)), 0),
+        "task_mode": str(form.get("task_mode", existing_agent.get("task_mode", "normal"))).strip() or "normal",
+        "priority": parse_int(form.get("priority", existing_agent.get("priority", 0)), 0),
+        "profile_version": str(form.get("profile_version", existing_agent.get("profile_version", ""))).strip(),
+        "config_version": str(form.get("config_version", existing_agent.get("config_version", ""))).strip(),
+        "config_payload": config_payload_text,
+        "exe_version": str(form.get("exe_version", existing_agent.get("exe_version", ""))).strip(),
+        "exe_url": str(form.get("exe_url", existing_agent.get("exe_url", ""))).strip(),
+        "exe_sha256": str(form.get("exe_sha256", existing_agent.get("exe_sha256", ""))).strip(),
+        "startup_exe": str(form.get("startup_exe", existing_agent.get("startup_exe", "QianNian.exe"))).strip()
         or "QianNian.exe",
-        "startup_args": str(form.get("startup_args", "")).strip(),
-        "script_entry": str(form.get("script_entry", "")).strip(),
+        "startup_args": str(form.get("startup_args", existing_agent.get("startup_args", ""))).strip(),
+        "script_entry": str(form.get("script_entry", existing_agent.get("script_entry", ""))).strip(),
         "resource_manifest_version": str(
-            form.get("resource_manifest_version", "")
+            form.get(
+                "resource_manifest_version",
+                existing_agent.get("resource_manifest_version", ""),
+            )
         ).strip(),
-        "notes": str(form.get("notes", "")).strip(),
+        "notes": str(form.get("notes", existing_agent.get("notes", ""))).strip(),
         "desired_run_state": normalize_desired_run_state(
-            form.get("desired_run_state", "run")
+            form.get("desired_run_state", existing_agent.get("desired_run_state", "run"))
         ),
         "schedule_daily_start": normalize_daily_start(
-            form.get("schedule_daily_start", "")
+            form.get("schedule_daily_start", existing_agent.get("schedule_daily_start", ""))
         ),
         "auto_restart_on_stale": form.get("auto_restart_on_stale") == "on",
         "restart_cooldown_seconds": max(
-            0, parse_int(form.get("restart_cooldown_seconds"), 600)
+            0,
+            parse_int(
+                form.get(
+                    "restart_cooldown_seconds",
+                    existing_agent.get("restart_cooldown_seconds", 600),
+                ),
+                600,
+            ),
         ),
-        "max_restart_per_day": max(0, parse_int(form.get("max_restart_per_day"), 3)),
+        "max_restart_per_day": max(
+            0,
+            parse_int(
+                form.get(
+                    "max_restart_per_day",
+                    existing_agent.get("max_restart_per_day", 3),
+                ),
+                3,
+            ),
+        ),
         "startup_grace_seconds": max(
-            0, parse_int(form.get("startup_grace_seconds"), 300)
+            0,
+            parse_int(
+                form.get(
+                    "startup_grace_seconds",
+                    existing_agent.get("startup_grace_seconds", 300),
+                ),
+                300,
+            ),
         ),
-        "desired_action": normalize_desired_action(form.get("desired_action", "")),
-        "action_seq": max(0, parse_int(form.get("action_seq"), 0)),
+        "desired_action": normalize_desired_action(
+            form.get("desired_action", existing_agent.get("desired_action", ""))
+        ),
+        "action_seq": max(
+            0,
+            parse_int(form.get("action_seq", existing_agent.get("action_seq", 0)), 0),
+        ),
     }
 
-    original_agent_id = str(form.get("original_agent_id", "")).strip() or None
     upsert_agent_profile(profile, original_agent_id)
     return RedirectResponse(
         build_console_redirect_url(
             auth_token,
-            f"{agent_id} 配置已保存",
+            f"{agent_id} ?????",
             edit_agent=agent_id,
         ),
         status_code=303,
     )
-
 
 @app.post("/console/agents/action")
 async def console_agent_action(
@@ -1517,7 +1888,7 @@ async def console_agent_action(
     action = normalize_desired_action(form.get("action", ""))
     if not agent_id or not action:
         return RedirectResponse(
-            build_console_redirect_url(auth_token, "未指定有效动作或 Agent"),
+            build_console_redirect_url(auth_token, "???????? Agent"),
             status_code=303,
         )
 
@@ -1526,7 +1897,7 @@ async def console_agent_action(
         return RedirectResponse(
             build_console_redirect_url(
                 auth_token,
-                f"{agent_id} 动作下发失败",
+                f"{agent_id} ??????",
                 edit_agent=agent_id,
             ),
             status_code=303,
@@ -1535,12 +1906,11 @@ async def console_agent_action(
     return RedirectResponse(
         build_console_redirect_url(
             auth_token,
-            f"{agent_id} 已下发动作 {action} (seq={action_seq})",
+            f"{agent_id} ?????: {action} (seq={action_seq})",
             edit_agent=agent_id,
         ),
         status_code=303,
     )
-
 
 @app.post("/console/agents/delete")
 async def console_agent_delete(
@@ -1553,10 +1923,9 @@ async def console_agent_delete(
     if agent_id:
         delete_agent_profile(agent_id)
     return RedirectResponse(
-        build_console_redirect_url(auth_token, f"{agent_id or 'Agent'} 配置已删除"),
+        build_console_redirect_url(auth_token, f"{agent_id or 'Agent'} ?????"),
         status_code=303,
     )
-
 
 @app.post("/console/resources/save")
 async def console_resource_save(
@@ -1569,7 +1938,11 @@ async def console_resource_save(
     name = str(form.get("name", "")).strip()
     if not name:
         return RedirectResponse(
-            build_console_redirect_url(auth_token, "资源名称不能为空"),
+            build_console_redirect_url(
+                auth_token,
+                "????????",
+                console_path="/console/resources",
+            ),
             status_code=303,
         )
 
@@ -1590,12 +1963,12 @@ async def console_resource_save(
     return RedirectResponse(
         build_console_redirect_url(
             auth_token,
-            f"{name} 资源已保存",
+            f"{name} ?????",
             edit_resource_id=resource_id,
+            console_path="/console/resources",
         ),
         status_code=303,
     )
-
 
 @app.post("/console/resources/delete")
 async def console_resource_delete(
@@ -1608,12 +1981,15 @@ async def console_resource_delete(
     resource = get_resource_item(resource_id)
     if resource_id > 0:
         delete_resource_item(resource_id)
-    resource_name = resource["name"] if resource else "资源"
+    resource_name = resource["name"] if resource else "??"
     return RedirectResponse(
-        build_console_redirect_url(auth_token, f"{resource_name} 已删除"),
+        build_console_redirect_url(
+            auth_token,
+            f"{resource_name} ???",
+            console_path="/console/resources",
+        ),
         status_code=303,
     )
-
 
 @app.get("/api/status")
 async def api_status() -> Dict[str, Any]:
@@ -1701,6 +2077,7 @@ async def api_report(
     auth_token: Optional[str] = Query(default=None),
 ) -> Dict[str, Any]:
     ensure_auth(x_auth_token, auth_token)
+    ensure_runtime_state_for_today()
     server_time = now_str()
     server_epoch = time.time()
     current_group = (
@@ -1750,6 +2127,79 @@ async def api_report(
     return {"ok": True, "server_time": server_time}
 
 
+
+@app.post("/api/agent/recovering")
+async def api_agent_recovering(
+    payload: RecoveryPayload,
+    x_auth_token: Optional[str] = Header(default=None),
+    auth_token: Optional[str] = Query(default=None),
+) -> Dict[str, Any]:
+    ensure_auth(x_auth_token, auth_token)
+    ensure_runtime_state_for_today()
+    server_time = now_str()
+    now_ts = time.time()
+    hold_seconds = max(
+        settings.alert_timeout_seconds * 2,
+        max(30, parse_int(payload.hold_seconds, 0)),
+    )
+    synthetic_epoch = now_ts + hold_seconds
+
+    with state_lock:
+        existing = dict(agent_states.get(payload.agent_id, {}))
+        region = payload.region or str(existing.get("region", ""))
+        current_group = payload.current_group or parse_int(existing.get("current_group"), 0)
+        finished_group = payload.finished_group or parse_int(existing.get("finished_group"), 0)
+        next_group = payload.next_group or parse_int(existing.get("next_group"), 0)
+        role_index = payload.role_index if payload.role_index is not None else parse_int(existing.get("role_index"), 0)
+        report = {
+            "event": f"recovering:{payload.reason or 'restart'}",
+            "agent_id": payload.agent_id,
+            "region": region,
+            "current_group": current_group,
+            "finished_group": finished_group,
+            "next_group": next_group,
+            "role_index": role_index,
+            "client_ts": payload.ts,
+            "server_time": server_time,
+            "server_epoch": synthetic_epoch,
+        }
+        agent_states[payload.agent_id] = report
+        stale_state[payload.agent_id] = False
+        completed_state[payload.agent_id] = False
+        last_alert_sent_at.pop(payload.agent_id, None)
+        alert_stale_started_at.pop(payload.agent_id, None)
+        alert_sent_count.pop(payload.agent_id, None)
+        history_cache.appendleft(
+            {
+                "event": report["event"],
+                "agent_id": payload.agent_id,
+                "region": region,
+                "current_group": current_group,
+                "finished_group": finished_group,
+                "next_group": next_group,
+                "role_index": role_index,
+                "client_ts": payload.ts,
+                "server_time": server_time,
+                "created_at": int(now_ts),
+            }
+        )
+
+    logger.info(
+        "agent recovering: agent=%s reason=%s hold=%s group=%s role=%s",
+        payload.agent_id,
+        payload.reason,
+        hold_seconds,
+        current_group,
+        role_index,
+    )
+    return {
+        "ok": True,
+        "server_time": server_time,
+        "hold_seconds": hold_seconds,
+        "status": "recovering",
+    }
+
+
 @app.post("/api/agent/remove")
 async def api_agent_remove(
     payload: RemoveAgentPayload,
@@ -1764,6 +2214,8 @@ async def api_agent_remove(
             agent_states.pop(payload.agent_id, None)
             removed = True
         stale_state.pop(payload.agent_id, None)
+        completed_state.pop(payload.agent_id, None)
+        completed_notice_sent.pop(payload.agent_id, None)
         last_alert_sent_at.pop(payload.agent_id, None)
         alert_stale_started_at.pop(payload.agent_id, None)
         alert_sent_count.pop(payload.agent_id, None)
@@ -1785,6 +2237,8 @@ async def api_agents_clear(
         agent_count = len(agent_states)
         agent_states.clear()
         stale_state.clear()
+        completed_state.clear()
+        completed_notice_sent.clear()
         last_alert_sent_at.clear()
         alert_stale_started_at.clear()
         alert_sent_count.clear()
