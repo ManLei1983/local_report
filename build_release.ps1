@@ -30,6 +30,7 @@ if (Test-Path (Join-Path $buildRoot $releaseName)) { Remove-Item (Join-Path $bui
     "$root\app.py"
 
 Copy-Item "$root\.env.example" "$releaseDir\.env.example" -Force
+Copy-Item "$root\DEPLOY_GUIDE.md" "$releaseDir\DEPLOY_GUIDE.md" -Force
 if ($IncludeEnv -and (Test-Path "$root\.env")) {
     Copy-Item "$root\.env" "$releaseDir\.env" -Force
 }
