@@ -8,6 +8,7 @@ import sqlite3
 import threading
 import time
 import urllib.request
+import sys
 from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -21,8 +22,18 @@ from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel, Field
 
 
-BASE_DIR = Path(__file__).resolve().parent
-load_dotenv(BASE_DIR / ".env")
+if getattr(sys, "frozen", False):
+    APP_ROOT = Path(sys.executable).resolve().parent
+    BUNDLE_DIR = Path(getattr(sys, "_MEIPASS", APP_ROOT))
+else:
+    APP_ROOT = Path(__file__).resolve().parent
+    BUNDLE_DIR = APP_ROOT
+
+TEMPLATES_DIR = APP_ROOT / "templates"
+if not TEMPLATES_DIR.exists():
+    TEMPLATES_DIR = BUNDLE_DIR / "templates"
+
+load_dotenv(APP_ROOT / ".env")
 
 
 def env_bool(name: str, default: bool) -> bool:
@@ -76,7 +87,7 @@ class Settings:
     ui_layout_mode: str = os.getenv("UI_LAYOUT_MODE", "grouped").strip().lower()
     ui_auto_refresh_seconds: int = env_int("UI_AUTO_REFRESH_SECONDS", 10)
 
-    db_path: Path = BASE_DIR / os.getenv("DB_PATH", "local_report.db")
+    db_path: Path = APP_ROOT / os.getenv("DB_PATH", "local_report.db")
     persist_reports: bool = env_bool("PERSIST_REPORTS", False)
     delete_db_on_startup: bool = env_bool("DELETE_DB_ON_STARTUP", True)
     db_clean_interval_days: int = env_int("DB_CLEAN_INTERVAL_DAYS", 0)
@@ -172,7 +183,7 @@ class RemoveAgentPayload(BaseModel):
 
 
 app = FastAPI(title=settings.app_name)
-templates = Jinja2Templates(directory=str(BASE_DIR / "templates"))
+templates = Jinja2Templates(directory=str(TEMPLATES_DIR))
 
 state_lock = threading.Lock()
 agent_states: Dict[str, Dict[str, Any]] = {}
@@ -2260,7 +2271,7 @@ if __name__ == "__main__":
     import uvicorn
 
     uvicorn.run(
-        "app:app",
+        app,
         host=settings.listen_host,
         port=settings.listen_port,
         reload=False,

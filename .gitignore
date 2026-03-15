@@ -17,3 +17,8 @@ local_report.db
 .idea/
 *.swp
 *.swo
+# Packaging output
+build/
+dist/
+*.spec
+
