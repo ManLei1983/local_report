@@ -1,4 +1,4 @@
-﻿param(
+param(
     [string]$PythonExe = "H:\python\3.11.9\python.exe",
     [switch]$IncludeEnv,
     [switch]$IncludeDb,
@@ -40,10 +40,32 @@ if ($IncludeDb -and (Test-Path "$root\local_report.db")) {
 
 @"
 @echo off
-cd /d %~dp0
-local_report_server.exe
-pause
+setlocal
+cd /d "%~dp0"
+
+if not exist "%~dp0local_report_server.exe" (
+    echo [ERROR] local_report_server.exe not found
+    pause
+    exit /b 1
+)
+
+tasklist /FI "IMAGENAME eq local_report_server.exe" 2>NUL | find /I "local_report_server.exe" >NUL
+if not errorlevel 1 exit /b 0
+
+powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -Command "Start-Process -FilePath '%~dp0local_report_server.exe' -WorkingDirectory '%~dp0' -WindowStyle Hidden"
+exit /b 0
 "@ | Set-Content -Path (Join-Path $releaseDir "start_local_report.bat") -Encoding ASCII
+
+@"
+@echo off
+setlocal
+
+tasklist /FI "IMAGENAME eq local_report_server.exe" 2>NUL | find /I "local_report_server.exe" >NUL
+if errorlevel 1 exit /b 0
+
+taskkill /F /IM local_report_server.exe >NUL 2>&1
+exit /b 0
+"@ | Set-Content -Path (Join-Path $releaseDir "stop_local_report.bat") -Encoding ASCII
 
 if ($Zip) {
     $zipPath = Join-Path $distRoot ("{0}_{1}.zip" -f $releaseName, (Get-Date -Format "yyyyMMdd_HHmmss"))

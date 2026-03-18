@@ -19,6 +19,8 @@
                 <td>
                     {% if r.stale %}
                         <span class="warn">超时</span>
+                    {% elif r.completed %}
+                        <span class="done">已完成</span>
                     {% else %}
                         <span class="ok">正常</span>
                     {% endif %}
@@ -188,6 +190,12 @@
             color: var(--warn);
         }
 
+        .badge-done {
+            background: #ecfeff;
+            border-color: #a5f3fc;
+            color: #0f766e;
+        }
+
         .region-section {
             border: 1px solid var(--line);
             border-radius: 14px;
@@ -251,6 +259,11 @@
 
         .warn {
             color: var(--warn);
+            font-weight: 600;
+        }
+
+        .done {
+            color: #0f766e;
             font-weight: 600;
         }
 
@@ -357,7 +370,11 @@
                                 <span class="badge badge-accent">Agent {{ group.count }}</span>
                                 {% if group.stale_count %}
                                     <span class="badge badge-warn">超时 {{ group.stale_count }}</span>
-                                {% else %}
+                                {% endif %}
+                                {% if group.completed_count %}
+                                    <span class="badge badge-done">已完成 {{ group.completed_count }}</span>
+                                {% endif %}
+                                {% if (not group.stale_count) and (not group.completed_count) %}
                                     <span class="badge">全部正常</span>
                                 {% endif %}
                             </div>

@@ -4,11 +4,11 @@ import json
 import logging
 import os
 import re
+import sys
 import sqlite3
 import threading
 import time
 import urllib.request
-import sys
 from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -23,17 +23,13 @@ from pydantic import BaseModel, Field
 
 
 if getattr(sys, "frozen", False):
-    APP_ROOT = Path(sys.executable).resolve().parent
-    BUNDLE_DIR = Path(getattr(sys, "_MEIPASS", APP_ROOT))
+    APP_DIR = Path(sys.executable).resolve().parent
+    RESOURCE_DIR = Path(getattr(sys, "_MEIPASS", APP_DIR))
 else:
-    APP_ROOT = Path(__file__).resolve().parent
-    BUNDLE_DIR = APP_ROOT
+    APP_DIR = Path(__file__).resolve().parent
+    RESOURCE_DIR = APP_DIR
 
-TEMPLATES_DIR = APP_ROOT / "templates"
-if not TEMPLATES_DIR.exists():
-    TEMPLATES_DIR = BUNDLE_DIR / "templates"
-
-load_dotenv(APP_ROOT / ".env")
+load_dotenv(APP_DIR / ".env")
 
 
 def env_bool(name: str, default: bool) -> bool:
@@ -87,7 +83,7 @@ class Settings:
     ui_layout_mode: str = os.getenv("UI_LAYOUT_MODE", "grouped").strip().lower()
     ui_auto_refresh_seconds: int = env_int("UI_AUTO_REFRESH_SECONDS", 10)
 
-    db_path: Path = APP_ROOT / os.getenv("DB_PATH", "local_report.db")
+    db_path: Path = APP_DIR / os.getenv("DB_PATH", "local_report.db")
     persist_reports: bool = env_bool("PERSIST_REPORTS", False)
     delete_db_on_startup: bool = env_bool("DELETE_DB_ON_STARTUP", True)
     db_clean_interval_days: int = env_int("DB_CLEAN_INTERVAL_DAYS", 0)
@@ -100,9 +96,7 @@ class Settings:
     alert_check_interval_seconds: int = env_int("ALERT_CHECK_INTERVAL_SECONDS", 10)
     alert_cooldown_seconds: int = env_int("ALERT_COOLDOWN_SECONDS", 360)
     alert_slow_mode_after_count: int = env_int("ALERT_SLOW_MODE_AFTER_COUNT", 10)
-    alert_slow_mode_after_seconds: int = env_int(
-        "ALERT_SLOW_MODE_AFTER_SECONDS", 3600
-    )
+    alert_slow_mode_after_seconds: int = env_int("ALERT_SLOW_MODE_AFTER_SECONDS", 3600)
     alert_slow_mode_cooldown_seconds: int = env_int(
         "ALERT_SLOW_MODE_COOLDOWN_SECONDS", 1800
     )
@@ -183,7 +177,16 @@ class RemoveAgentPayload(BaseModel):
 
 
 app = FastAPI(title=settings.app_name)
-templates = Jinja2Templates(directory=str(TEMPLATES_DIR))
+templates = Jinja2Templates(directory=str(RESOURCE_DIR / "templates"))
+
+
+@app.middleware("http")
+async def ensure_utf8_charset(request: Request, call_next):
+    response = await call_next(request)
+    content_type = response.headers.get("content-type", "")
+    if content_type.startswith("application/json") and "charset=" not in content_type.lower():
+        response.headers["content-type"] = "application/json; charset=utf-8"
+    return response
 
 state_lock = threading.Lock()
 agent_states: Dict[str, Dict[str, Any]] = {}
@@ -251,7 +254,7 @@ def init_db() -> None:
             )
             """
         )
-        # 兼容旧版本数据库：reports 表可能还没有 created_at 列
+        # Backfill created_at for older reports tables.
         cols = {
             row[1] for row in db_conn.execute("PRAGMA table_info(reports)").fetchall()
         }
@@ -382,7 +385,7 @@ def maybe_cleanup_db() -> None:
 
         if not settings.persist_reports:
             try:
-                # 3.8新增：VACUUM 不能在事务内执行
+                # 3.8閺傛澘顤冮敍姝廇CUUM 娑撳秷鍏橀崷銊ょ皑閸斺€冲敶閹笛嗩攽
                 db_conn.execute("VACUUM")
             except sqlite3.OperationalError as exc:
                 logger.warning("db vacuum skipped: %s", exc)
@@ -544,7 +547,9 @@ def extract_qiannian_ui_settings(raw_text: str) -> Dict[str, Any]:
     if "launch_button" not in ui_payload and "launch_button" in payload_copy:
         ui_payload["launch_button"] = payload_copy.pop("launch_button")
 
-    if "checkboxes" not in ui_payload and isinstance(payload_copy.get("checkboxes"), dict):
+    if "checkboxes" not in ui_payload and isinstance(
+        payload_copy.get("checkboxes"), dict
+    ):
         ui_payload["checkboxes"] = payload_copy.pop("checkboxes")
 
     role_index_value = 0
@@ -563,13 +568,17 @@ def extract_qiannian_ui_settings(raw_text: str) -> Dict[str, Any]:
     if not isinstance(checkbox_values, dict):
         checkbox_values = {}
 
-    defaults["ui_launch_button"] = normalize_launch_button(ui_payload.get("launch_button", ""))
+    defaults["ui_launch_button"] = normalize_launch_button(
+        ui_payload.get("launch_button", "")
+    )
     defaults["ui_role_index"] = role_index_value
     for key in QIANNIAN_UI_CHECKBOX_KEYS:
         defaults[f"ui_checkbox_{key}"] = bool(checkbox_values.get(key, False))
 
     if payload_copy:
-        defaults["config_payload_extra"] = json.dumps(payload_copy, ensure_ascii=False, indent=2)
+        defaults["config_payload_extra"] = json.dumps(
+            payload_copy, ensure_ascii=False, indent=2
+        )
     return defaults
 
 
@@ -592,14 +601,21 @@ def build_config_payload_text(form: Dict[str, str], original_raw: str) -> str:
     if extra_raw:
         extra_payload = parse_json_payload(extra_raw)
         if not isinstance(extra_payload, dict):
-            raise ValueError("?? JSON ???????? JSON ??")
+            raise ValueError("高级 JSON 扩展必须是合法 JSON 对象")
     else:
         extra_payload = {}
 
     ui_payload = {
         key: value
         for key, value in existing_ui_payload.items()
-        if key not in {"launch_button", "role_index", "selorder", "start_role_index", "checkboxes"}
+        if key
+        not in {
+            "launch_button",
+            "role_index",
+            "selorder",
+            "start_role_index",
+            "checkboxes",
+        }
     }
 
     launch_button = normalize_launch_button(form.get("ui_launch_button", ""))
@@ -611,8 +627,7 @@ def build_config_payload_text(form: Dict[str, str], original_raw: str) -> str:
         ui_payload["selorder"] = max(0, parse_int(role_index_text, 0))
 
     checkbox_values = {
-        key: form.get(f"ui_checkbox_{key}") == "on"
-        for key in QIANNIAN_UI_CHECKBOX_KEYS
+        key: form.get(f"ui_checkbox_{key}") == "on" for key in QIANNIAN_UI_CHECKBOX_KEYS
     }
     ui_payload["checkboxes"] = checkbox_values
 
@@ -704,7 +719,9 @@ def ensure_table_columns(table_name: str, column_defs: Dict[str, str]) -> None:
     for column_name, definition in column_defs.items():
         if column_name in existing_columns:
             continue
-        db_conn.execute(f"ALTER TABLE {table_name} ADD COLUMN {column_name} {definition}")
+        db_conn.execute(
+            f"ALTER TABLE {table_name} ADD COLUMN {column_name} {definition}"
+        )
 
 
 def get_agent_complete_role_index(agent_profile: Optional[Dict[str, Any]]) -> int:
@@ -761,9 +778,7 @@ def build_agent_control(agent_profile: Dict[str, Any]) -> Dict[str, Any]:
         "schedule_daily_start": normalize_daily_start(
             agent_profile.get("schedule_daily_start", "")
         ),
-        "auto_restart_on_stale": bool(
-            agent_profile.get("auto_restart_on_stale", True)
-        ),
+        "auto_restart_on_stale": bool(agent_profile.get("auto_restart_on_stale", True)),
         "restart_cooldown_seconds": max(
             0, parse_int(agent_profile.get("restart_cooldown_seconds"), 600)
         ),
@@ -779,7 +794,6 @@ def build_agent_control(agent_profile: Dict[str, Any]) -> Dict[str, Any]:
         ),
         "action_seq": max(0, parse_int(agent_profile.get("action_seq"), 0)),
     }
-
 
 def ensure_runtime_state_for_today() -> None:
     global current_runtime_day
@@ -813,11 +827,9 @@ def ensure_runtime_state_for_today() -> None:
 def build_agent_runtime_snapshot(agent_id: str) -> Dict[str, Any]:
     ensure_runtime_state_for_today()
     now_ts = time.time()
-    agent_profile = get_agent_profile(agent_id)
     with state_lock:
         item = dict(agent_states.get(agent_id, {}))
 
-    completion_state = get_completion_state(agent_profile, item if item else None)
     if not item:
         return {
             "has_report": False,
@@ -831,18 +843,19 @@ def build_agent_runtime_snapshot(agent_id: str) -> Dict[str, Any]:
             "next_group": 0,
             "role_index": 0,
             "event": "",
-            "completed": completion_state["completed"],
-            "target_group_end": completion_state["target_group_end"],
-            "complete_role_index": completion_state["complete_role_index"],
-            "completion_basis": completion_state["completion_basis"],
+            "completed": False,
+            "target_group_end": max(0, parse_int((get_agent_profile(agent_id) or {}).get("group_end"), 0)),
+            "complete_role_index": get_agent_complete_role_index(get_agent_profile(agent_id)),
+            "completion_basis": "no_report",
         }
 
+    agent_profile = get_agent_profile(agent_id)
+    completion_state = get_completion_state(agent_profile, item)
     elapsed = int(max(0, now_ts - float(item.get("server_epoch", 0))))
-    stale = False if completion_state["completed"] else elapsed > settings.alert_timeout_seconds
     return {
         "has_report": True,
         "report_timeout_seconds": settings.alert_timeout_seconds,
-        "stale": stale,
+        "stale": False if completion_state["completed"] else elapsed > settings.alert_timeout_seconds,
         "elapsed": elapsed,
         "server_time": item.get("server_time", ""),
         "server_epoch": item.get("server_epoch", 0),
@@ -859,36 +872,38 @@ def build_agent_runtime_snapshot(agent_id: str) -> Dict[str, Any]:
 
 
 def blank_agent_profile() -> Dict[str, Any]:
-    return attach_qiannian_ui_settings({
-        "agent_id": "",
-        "enabled": True,
-        "region": "",
-        "group_start": 0,
-        "group_end": 0,
-        "task_mode": "normal",
-        "priority": 0,
-        "profile_version": "",
-        "config_version": "",
-        "config_payload": "",
-        "exe_version": "",
-        "exe_url": "",
-        "exe_sha256": "",
-        "startup_exe": "QianNian.exe",
-        "startup_args": "",
-        "script_entry": "",
-        "resource_manifest_version": "",
-        "notes": "",
-        "desired_run_state": "run",
-        "schedule_daily_start": "",
-        "auto_restart_on_stale": True,
-        "restart_cooldown_seconds": 600,
-        "max_restart_per_day": 3,
-        "startup_grace_seconds": 300,
-        "desired_action": "",
-        "action_seq": 0,
-        "updated_at": "",
-        "updated_epoch": 0,
-    })
+    return attach_qiannian_ui_settings(
+        {
+            "agent_id": "",
+            "enabled": True,
+            "region": "",
+            "group_start": 0,
+            "group_end": 0,
+            "task_mode": "normal",
+            "priority": 0,
+            "profile_version": "",
+            "config_version": "",
+            "config_payload": "",
+            "exe_version": "",
+            "exe_url": "",
+            "exe_sha256": "",
+            "startup_exe": "QianNian.exe",
+            "startup_args": "",
+            "script_entry": "",
+            "resource_manifest_version": "",
+            "notes": "",
+            "desired_run_state": "run",
+            "schedule_daily_start": "",
+            "auto_restart_on_stale": True,
+            "restart_cooldown_seconds": 600,
+            "max_restart_per_day": 3,
+            "startup_grace_seconds": 300,
+            "desired_action": "",
+            "action_seq": 0,
+            "updated_at": "",
+            "updated_epoch": 0,
+        }
+    )
 
 
 def blank_resource_item() -> Dict[str, Any]:
@@ -910,62 +925,74 @@ def blank_resource_item() -> Dict[str, Any]:
 
 
 def row_to_agent_profile(row: sqlite3.Row) -> Dict[str, Any]:
-    return attach_qiannian_ui_settings({
-        "agent_id": row["agent_id"],
-        "enabled": bool(row["enabled"]),
-        "region": row["region"] or "",
-        "group_start": row["group_start"],
-        "group_end": row["group_end"],
-        "task_mode": row["task_mode"] or "normal",
-        "priority": row["priority"],
-        "profile_version": row["profile_version"] or "",
-        "config_version": row["config_version"] or "",
-        "config_payload": row["config_payload"] or "",
-        "exe_version": row["exe_version"] or "",
-        "exe_url": row["exe_url"] or "",
-        "exe_sha256": row["exe_sha256"] or "",
-        "startup_exe": row["startup_exe"] or "QianNian.exe",
-        "startup_args": row["startup_args"] or "",
-        "script_entry": row["script_entry"] or "",
-        "resource_manifest_version": row["resource_manifest_version"] or "",
-        "notes": row["notes"] or "",
-        "desired_run_state": normalize_desired_run_state(
-            row["desired_run_state"] if "desired_run_state" in row.keys() else "run"
-        ),
-        "schedule_daily_start": normalize_daily_start(
-            row["schedule_daily_start"] if "schedule_daily_start" in row.keys() else ""
-        ),
-        "auto_restart_on_stale": bool(
-            row["auto_restart_on_stale"]
-            if "auto_restart_on_stale" in row.keys()
-            else True
-        ),
-        "restart_cooldown_seconds": parse_int(
-            row["restart_cooldown_seconds"]
-            if "restart_cooldown_seconds" in row.keys()
-            else 600,
-            600,
-        ),
-        "max_restart_per_day": parse_int(
-            row["max_restart_per_day"] if "max_restart_per_day" in row.keys() else 3,
-            3,
-        ),
-        "startup_grace_seconds": parse_int(
-            row["startup_grace_seconds"]
-            if "startup_grace_seconds" in row.keys()
-            else 300,
-            300,
-        ),
-        "desired_action": normalize_desired_action(
-            row["desired_action"] if "desired_action" in row.keys() else ""
-        ),
-        "action_seq": parse_int(
-            row["action_seq"] if "action_seq" in row.keys() else 0,
-            0,
-        ),
-        "updated_at": row["updated_at"],
-        "updated_epoch": row["updated_epoch"],
-    })
+    return attach_qiannian_ui_settings(
+        {
+            "agent_id": row["agent_id"],
+            "enabled": bool(row["enabled"]),
+            "region": row["region"] or "",
+            "group_start": row["group_start"],
+            "group_end": row["group_end"],
+            "task_mode": row["task_mode"] or "normal",
+            "priority": row["priority"],
+            "profile_version": row["profile_version"] or "",
+            "config_version": row["config_version"] or "",
+            "config_payload": row["config_payload"] or "",
+            "exe_version": row["exe_version"] or "",
+            "exe_url": row["exe_url"] or "",
+            "exe_sha256": row["exe_sha256"] or "",
+            "startup_exe": row["startup_exe"] or "QianNian.exe",
+            "startup_args": row["startup_args"] or "",
+            "script_entry": row["script_entry"] or "",
+            "resource_manifest_version": row["resource_manifest_version"] or "",
+            "notes": row["notes"] or "",
+            "desired_run_state": normalize_desired_run_state(
+                row["desired_run_state"] if "desired_run_state" in row.keys() else "run"
+            ),
+            "schedule_daily_start": normalize_daily_start(
+                row["schedule_daily_start"]
+                if "schedule_daily_start" in row.keys()
+                else ""
+            ),
+            "auto_restart_on_stale": bool(
+                row["auto_restart_on_stale"]
+                if "auto_restart_on_stale" in row.keys()
+                else True
+            ),
+            "restart_cooldown_seconds": parse_int(
+                (
+                    row["restart_cooldown_seconds"]
+                    if "restart_cooldown_seconds" in row.keys()
+                    else 600
+                ),
+                600,
+            ),
+            "max_restart_per_day": parse_int(
+                (
+                    row["max_restart_per_day"]
+                    if "max_restart_per_day" in row.keys()
+                    else 3
+                ),
+                3,
+            ),
+            "startup_grace_seconds": parse_int(
+                (
+                    row["startup_grace_seconds"]
+                    if "startup_grace_seconds" in row.keys()
+                    else 300
+                ),
+                300,
+            ),
+            "desired_action": normalize_desired_action(
+                row["desired_action"] if "desired_action" in row.keys() else ""
+            ),
+            "action_seq": parse_int(
+                row["action_seq"] if "action_seq" in row.keys() else 0,
+                0,
+            ),
+            "updated_at": row["updated_at"],
+            "updated_epoch": row["updated_epoch"],
+        }
+    )
 
 
 def row_to_resource_item(row: sqlite3.Row) -> Dict[str, Any]:
@@ -995,8 +1022,7 @@ def list_agent_profiles() -> List[Dict[str, Any]]:
             SELECT
             """
             + AGENT_PROFILE_SELECT_FIELDS
-            +
-            """
+            + """
             FROM agent_profiles
             ORDER BY enabled DESC, agent_id ASC
             """
@@ -1013,8 +1039,7 @@ def get_agent_profile(agent_id: str) -> Optional[Dict[str, Any]]:
             SELECT
             """
             + AGENT_PROFILE_SELECT_FIELDS
-            +
-            """
+            + """
             FROM agent_profiles
             WHERE agent_id = ?
             """,
@@ -1023,7 +1048,9 @@ def get_agent_profile(agent_id: str) -> Optional[Dict[str, Any]]:
     return row_to_agent_profile(row) if row else None
 
 
-def upsert_agent_profile(profile: Dict[str, Any], original_agent_id: Optional[str]) -> None:
+def upsert_agent_profile(
+    profile: Dict[str, Any], original_agent_id: Optional[str]
+) -> None:
     if not db_conn:
         return
     current_time = now_str()
@@ -1098,7 +1125,9 @@ def upsert_agent_profile(profile: Dict[str, Any], original_agent_id: Optional[st
                     profile["script_entry"],
                     profile["resource_manifest_version"],
                     profile["notes"],
-                    normalize_desired_run_state(profile.get("desired_run_state", "run")),
+                    normalize_desired_run_state(
+                        profile.get("desired_run_state", "run")
+                    ),
                     normalize_daily_start(profile.get("schedule_daily_start", "")),
                     1 if profile.get("auto_restart_on_stale", True) else 0,
                     max(0, parse_int(profile.get("restart_cooldown_seconds"), 600)),
@@ -1159,7 +1188,9 @@ def delete_agent_profile(agent_id: str) -> int:
             return cur.rowcount
 
 
-def resource_applies_to_agent(resource: Dict[str, Any], agent_id: Optional[str]) -> bool:
+def resource_applies_to_agent(
+    resource: Dict[str, Any], agent_id: Optional[str]
+) -> bool:
     targets = split_csv_text(resource.get("target_agents", ""))
     if not targets:
         return True
@@ -1272,7 +1303,9 @@ def delete_resource_item(resource_id: int) -> int:
             return cur.rowcount
 
 
-def build_manifest_items(request: Request, items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+def build_manifest_items(
+    request: Request, items: List[Dict[str, Any]]
+) -> List[Dict[str, Any]]:
     manifest_items: List[Dict[str, Any]] = []
     for item in items:
         manifest_items.append(
@@ -1422,7 +1455,6 @@ def build_rows() -> List[Dict[str, Any]]:
     )
     return rows
 
-
 def build_region_groups(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     groups: List[Dict[str, Any]] = []
 
@@ -1440,6 +1472,7 @@ def build_region_groups(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
                 "region_number": row["region_number"],
                 "count": 0,
                 "stale_count": 0,
+                "completed_count": 0,
                 "rows": [],
             }
             groups.append(group)
@@ -1448,6 +1481,8 @@ def build_region_groups(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         group["count"] += 1
         if row["stale"]:
             group["stale_count"] += 1
+        if row.get("completed", False):
+            group["completed_count"] += 1
 
     return groups
 
@@ -1503,46 +1538,67 @@ async def post_wecom_markdown(content: str) -> bool:
     return await asyncio.to_thread(post_wecom_markdown_sync, content)
 
 
-def pick_report_time_text(item: Dict[str, Any]) -> str:
-    return str(item.get("server_time") or item.get("client_ts") or "-")
-
-
-
 def build_timeout_markdown(item: Dict[str, Any], elapsed: int) -> str:
-    report_time = pick_report_time_text(item)
     return (
-        f"[{item['agent_id']} 上报超时告警]\n"
-        f"- 区服: `{item['region']}`\n"
-        f"- 当前执行组: `{item['current_group']}`\n"
-        f"- 当前角色: `{item['role_index']}`\n"
-        f"- 最后上报时间: {report_time}\n"
-        f"- 距今秒数: `{elapsed}`\n"
+        f"[{item['agent_id']} \u4e0a\u62a5\u8d85\u65f6\u544a\u8b66]\n"
+        f"- \u533a\u670d: `{item['region']}`\n"
+        f"- \u5f53\u524d\u6267\u884c\u7ec4: `{item['current_group']}`\n"
+        f"- \u5f53\u524d\u89d2\u8272\u7d22\u5f15: `{item['role_index']}`\n"
+        f"- \u6700\u540e\u4e0a\u62a5\u65f6\u95f4: `{item['server_time']}`\n"
+        f"- \u8ddd\u4eca\u79d2\u6570: `{elapsed}`\n"
     )
-
-
 
 def build_recover_markdown(item: Dict[str, Any], elapsed: int) -> str:
-    report_time = pick_report_time_text(item)
     return (
-        f"[{item['agent_id']} 上报恢复通知]\n"
-        f"- 区服: `{item['region']}`\n"
-        f"- 当前执行组: `{item['current_group']}`\n"
-        f"- 当前角色: `{item['role_index']}`\n"
-        f"- 最新上报时间: {report_time}\n"
-        f"- 当前距今秒数: `{elapsed}`\n"
+        f"[{item['agent_id']} \u5df2\u6062\u590d\u4e0a\u62a5]\n"
+        f"- \u533a\u670d: `{item['region']}`\n"
+        f"- \u5f53\u524d\u6267\u884c\u7ec4: `{item['current_group']}`\n"
+        f"- \u5f53\u524d\u89d2\u8272\u7d22\u5f15: `{item['role_index']}`\n"
+        f"- \u6700\u65b0\u4e0a\u62a5\u65f6\u95f4: `{item['server_time']}`\n"
+        f"- \u4e0a\u6b21\u8d85\u65f6\u79d2\u6570: `{elapsed}`\n"
     )
-
-
 
 def build_completed_markdown(item: Dict[str, Any]) -> str:
-    report_time = pick_report_time_text(item)
     return (
-        f"[{item['agent_id']} 已完成预定任务]\n"
-        f"- 区服: `{item['region']}`\n"
-        f"- 当前执行组: `{item['current_group']}` / 目标结束组: `{item['target_group_end']}`\n"
-        f"- 当前角色索引: `{item['role_index']}` / 完成阈值: `{item['complete_role_index']}`\n"
-        f"- 最新上报时间: {report_time}\n"
+        f"[{item['agent_id']} \u5df2\u5b8c\u6210\u9884\u5b9a\u4efb\u52a1]\n"
+        f"- \u533a\u670d: `{item['region']}`\n"
+        f"- \u5f53\u524d\u6267\u884c\u7ec4: `{item['current_group']}` / \u76ee\u6807\u7ed3\u675f\u7ec4: `{item['target_group_end']}`\n"
+        f"- \u5f53\u524d\u89d2\u8272\u7d22\u5f15: `{item['role_index']}` / \u5b8c\u6210\u9608\u503c: `{item['complete_role_index']}`\n"
+        f"- \u6700\u65b0\u4e0a\u62a5\u65f6\u95f4: `{item['server_time']}`\n"
     )
+
+async def maybe_send_completed_notice(agent_id: str, report: Dict[str, Any]) -> None:
+    agent_profile = get_agent_profile(agent_id)
+    row = {
+        **report,
+        "elapsed": 0,
+        "region_number": extract_region_number(report.get("region", "")),
+    }
+    completion_state = get_completion_state(agent_profile, report)
+    row.update(
+        {
+            "stale": False,
+            "completed": completion_state["completed"],
+            "target_group_end": completion_state["target_group_end"],
+            "complete_role_index": completion_state["complete_role_index"],
+            "completion_basis": completion_state["completion_basis"],
+        }
+    )
+
+    if not row["completed"]:
+        return
+
+    if not completed_notice_sent.get(agent_id, False):
+        ok = await post_wecom_markdown(build_completed_markdown(row))
+        if ok:
+            completed_notice_sent[agent_id] = True
+            logger.info("completed alert sent immediately: agent=%s", agent_id)
+
+    completed_state[agent_id] = True
+    stale_state[agent_id] = False
+    alert_stale_started_at.pop(agent_id, None)
+    alert_sent_count.pop(agent_id, None)
+    last_alert_sent_at.pop(agent_id, None)
 
 
 def get_alert_cooldown_seconds(agent_id: str, now_ts: float) -> int:
@@ -1734,7 +1790,9 @@ async def config_console(
             "selected_agent": selected_agent,
             "selected_resource": selected_resource,
             "dashboard_url": append_query_params("/", auth_token=auth_token),
-            "resources_console_url": append_query_params("/console/resources", auth_token=auth_token),
+            "resources_console_url": append_query_params(
+                "/console/resources", auth_token=auth_token
+            ),
             "agent_profile_count": len(agent_profiles),
             "resource_item_count": len(resource_items),
         },
@@ -1779,12 +1837,14 @@ async def console_agent_save(
     agent_id = str(form.get("agent_id", "")).strip()
     if not agent_id:
         return RedirectResponse(
-            build_console_redirect_url(auth_token, "Agent ID ????"),
+            build_console_redirect_url(auth_token, "Agent ID 不能为空"),
             status_code=303,
         )
 
     original_agent_id = str(form.get("original_agent_id", "")).strip() or None
-    existing_agent = get_agent_profile(original_agent_id or agent_id) or blank_agent_profile()
+    existing_agent = (
+        get_agent_profile(original_agent_id or agent_id) or blank_agent_profile()
+    )
 
     try:
         config_payload_text = build_config_payload_text(
@@ -1792,7 +1852,10 @@ async def console_agent_save(
             str(
                 form.get(
                     "config_payload_original",
-                    existing_agent.get("config_payload_original", existing_agent.get("config_payload", "")),
+                    existing_agent.get(
+                        "config_payload_original",
+                        existing_agent.get("config_payload", ""),
+                    ),
                 )
             ),
         )
@@ -1810,20 +1873,43 @@ async def console_agent_save(
         "agent_id": agent_id,
         "enabled": form.get("enabled") == "on",
         "region": str(form.get("region", existing_agent.get("region", ""))).strip(),
-        "group_start": parse_int(form.get("group_start", existing_agent.get("group_start", 0)), 0),
-        "group_end": parse_int(form.get("group_end", existing_agent.get("group_end", 0)), 0),
-        "task_mode": str(form.get("task_mode", existing_agent.get("task_mode", "normal"))).strip() or "normal",
-        "priority": parse_int(form.get("priority", existing_agent.get("priority", 0)), 0),
-        "profile_version": str(form.get("profile_version", existing_agent.get("profile_version", ""))).strip(),
-        "config_version": str(form.get("config_version", existing_agent.get("config_version", ""))).strip(),
+        "group_start": parse_int(
+            form.get("group_start", existing_agent.get("group_start", 0)), 0
+        ),
+        "group_end": parse_int(
+            form.get("group_end", existing_agent.get("group_end", 0)), 0
+        ),
+        "task_mode": str(
+            form.get("task_mode", existing_agent.get("task_mode", "normal"))
+        ).strip()
+        or "normal",
+        "priority": parse_int(
+            form.get("priority", existing_agent.get("priority", 0)), 0
+        ),
+        "profile_version": str(
+            form.get("profile_version", existing_agent.get("profile_version", ""))
+        ).strip(),
+        "config_version": str(
+            form.get("config_version", existing_agent.get("config_version", ""))
+        ).strip(),
         "config_payload": config_payload_text,
-        "exe_version": str(form.get("exe_version", existing_agent.get("exe_version", ""))).strip(),
+        "exe_version": str(
+            form.get("exe_version", existing_agent.get("exe_version", ""))
+        ).strip(),
         "exe_url": str(form.get("exe_url", existing_agent.get("exe_url", ""))).strip(),
-        "exe_sha256": str(form.get("exe_sha256", existing_agent.get("exe_sha256", ""))).strip(),
-        "startup_exe": str(form.get("startup_exe", existing_agent.get("startup_exe", "QianNian.exe"))).strip()
+        "exe_sha256": str(
+            form.get("exe_sha256", existing_agent.get("exe_sha256", ""))
+        ).strip(),
+        "startup_exe": str(
+            form.get("startup_exe", existing_agent.get("startup_exe", "QianNian.exe"))
+        ).strip()
         or "QianNian.exe",
-        "startup_args": str(form.get("startup_args", existing_agent.get("startup_args", ""))).strip(),
-        "script_entry": str(form.get("script_entry", existing_agent.get("script_entry", ""))).strip(),
+        "startup_args": str(
+            form.get("startup_args", existing_agent.get("startup_args", ""))
+        ).strip(),
+        "script_entry": str(
+            form.get("script_entry", existing_agent.get("script_entry", ""))
+        ).strip(),
         "resource_manifest_version": str(
             form.get(
                 "resource_manifest_version",
@@ -1832,10 +1918,14 @@ async def console_agent_save(
         ).strip(),
         "notes": str(form.get("notes", existing_agent.get("notes", ""))).strip(),
         "desired_run_state": normalize_desired_run_state(
-            form.get("desired_run_state", existing_agent.get("desired_run_state", "run"))
+            form.get(
+                "desired_run_state", existing_agent.get("desired_run_state", "run")
+            )
         ),
         "schedule_daily_start": normalize_daily_start(
-            form.get("schedule_daily_start", existing_agent.get("schedule_daily_start", ""))
+            form.get(
+                "schedule_daily_start", existing_agent.get("schedule_daily_start", "")
+            )
         ),
         "auto_restart_on_stale": form.get("auto_restart_on_stale") == "on",
         "restart_cooldown_seconds": max(
@@ -1881,7 +1971,7 @@ async def console_agent_save(
     return RedirectResponse(
         build_console_redirect_url(
             auth_token,
-            f"{agent_id} ?????",
+            f"{agent_id} 已保存配置",
             edit_agent=agent_id,
         ),
         status_code=303,
@@ -1899,7 +1989,7 @@ async def console_agent_action(
     action = normalize_desired_action(form.get("action", ""))
     if not agent_id or not action:
         return RedirectResponse(
-            build_console_redirect_url(auth_token, "???????? Agent"),
+            build_console_redirect_url(auth_token, "请选择有效的 Agent 和动作"),
             status_code=303,
         )
 
@@ -1908,7 +1998,7 @@ async def console_agent_action(
         return RedirectResponse(
             build_console_redirect_url(
                 auth_token,
-                f"{agent_id} ??????",
+                f"{agent_id} 动作下发失败",
                 edit_agent=agent_id,
             ),
             status_code=303,
@@ -1917,7 +2007,7 @@ async def console_agent_action(
     return RedirectResponse(
         build_console_redirect_url(
             auth_token,
-            f"{agent_id} ?????: {action} (seq={action_seq})",
+            f"{agent_id} 动作已下发: {action} (seq={action_seq})",
             edit_agent=agent_id,
         ),
         status_code=303,
@@ -1934,7 +2024,7 @@ async def console_agent_delete(
     if agent_id:
         delete_agent_profile(agent_id)
     return RedirectResponse(
-        build_console_redirect_url(auth_token, f"{agent_id or 'Agent'} ?????"),
+        build_console_redirect_url(auth_token, f"{agent_id or 'Agent'} 已删除"),
         status_code=303,
     )
 
@@ -1951,7 +2041,7 @@ async def console_resource_save(
         return RedirectResponse(
             build_console_redirect_url(
                 auth_token,
-                "????????",
+                "资源名称不能为空",
                 console_path="/console/resources",
             ),
             status_code=303,
@@ -1974,7 +2064,7 @@ async def console_resource_save(
     return RedirectResponse(
         build_console_redirect_url(
             auth_token,
-            f"{name} ?????",
+            f"{name} 已保存",
             edit_resource_id=resource_id,
             console_path="/console/resources",
         ),
@@ -1992,11 +2082,11 @@ async def console_resource_delete(
     resource = get_resource_item(resource_id)
     if resource_id > 0:
         delete_resource_item(resource_id)
-    resource_name = resource["name"] if resource else "??"
+    resource_name = resource["name"] if resource else "资源"
     return RedirectResponse(
         build_console_redirect_url(
             auth_token,
-            f"{resource_name} ???",
+            f"{resource_name} 已删除",
             console_path="/console/resources",
         ),
         status_code=303,
@@ -2128,6 +2218,7 @@ async def api_report(
         )
 
     save_report_to_db(report)
+    await maybe_send_completed_notice(payload.agent_id, report)
     logger.info(
         "report received: agent=%s region=%s group=%s role=%s",
         payload.agent_id,
@@ -2136,7 +2227,6 @@ async def api_report(
         payload.role_index,
     )
     return {"ok": True, "server_time": server_time}
-
 
 
 @app.post("/api/agent/recovering")
@@ -2158,10 +2248,18 @@ async def api_agent_recovering(
     with state_lock:
         existing = dict(agent_states.get(payload.agent_id, {}))
         region = payload.region or str(existing.get("region", ""))
-        current_group = payload.current_group or parse_int(existing.get("current_group"), 0)
-        finished_group = payload.finished_group or parse_int(existing.get("finished_group"), 0)
+        current_group = payload.current_group or parse_int(
+            existing.get("current_group"), 0
+        )
+        finished_group = payload.finished_group or parse_int(
+            existing.get("finished_group"), 0
+        )
         next_group = payload.next_group or parse_int(existing.get("next_group"), 0)
-        role_index = payload.role_index if payload.role_index is not None else parse_int(existing.get("role_index"), 0)
+        role_index = (
+            payload.role_index
+            if payload.role_index is not None
+            else parse_int(existing.get("role_index"), 0)
+        )
         report = {
             "event": f"recovering:{payload.reason or 'restart'}",
             "agent_id": payload.agent_id,
@@ -2177,6 +2275,7 @@ async def api_agent_recovering(
         agent_states[payload.agent_id] = report
         stale_state[payload.agent_id] = False
         completed_state[payload.agent_id] = False
+        completed_notice_sent.pop(payload.agent_id, None)
         last_alert_sent_at.pop(payload.agent_id, None)
         alert_stale_started_at.pop(payload.agent_id, None)
         alert_sent_count.pop(payload.agent_id, None)

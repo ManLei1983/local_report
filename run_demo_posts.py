@@ -132,7 +132,9 @@ def post_json(url: str, payload: Dict[str, Any], auth_token: str) -> int:
 
     with urllib.request.urlopen(request, timeout=10) as response:
         body = response.read().decode("utf-8", "ignore")
-        print(f"[{response.status}] {request_payload['agent_id']} {request_payload['region']} -> {body}")
+        print(
+            f"[{response.status}] {request_payload['agent_id']} {request_payload['region']} -> {body}"
+        )
         return response.status
 
 
