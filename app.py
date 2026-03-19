@@ -1,4 +1,4 @@
-import asyncio
+﻿import asyncio
 import datetime as dt
 import json
 import logging
@@ -731,6 +731,7 @@ def build_console_redirect_url(
     message: Optional[str] = None,
     edit_agent: Optional[str] = None,
     edit_resource_id: Optional[int] = None,
+    edit_assist_helper: Optional[str] = None,
     console_path: str = "/console",
 ) -> str:
     return append_query_params(
@@ -739,6 +740,7 @@ def build_console_redirect_url(
         message=message,
         edit_agent=edit_agent,
         edit_resource_id=edit_resource_id,
+        edit_assist_helper=edit_assist_helper,
     )
 
 
@@ -1773,6 +1775,34 @@ def get_active_assist_for_helper(
     return row_to_assist_override(row) if row else None
 
 
+def list_active_assist_overrides(
+    work_date: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    if not db_conn:
+        return []
+    effective_date = str(work_date or today_str())
+    with db_lock:
+        rows = db_conn.execute(
+            """
+            SELECT id, work_date, target_agent_id, helper_agent_id, region,
+                   delegate_start, delegate_end,
+                   original_target_group_end, effective_target_group_end,
+                   created_at, updated_at
+            FROM agent_assist_overrides
+            WHERE work_date = ?
+            ORDER BY updated_at DESC, helper_agent_id ASC, target_agent_id ASC
+            """,
+            (effective_date,),
+        ).fetchall()
+    items: List[Dict[str, Any]] = []
+    for row in rows:
+        item = row_to_assist_override(row)
+        item["helper_summary"] = build_assist_view(item, role="helper")["summary"]
+        item["target_summary"] = build_assist_view(item, role="target")["summary"]
+        items.append(item)
+    return items
+
+
 def build_assist_view(
     assist_row: Optional[Dict[str, Any]],
     role: str = "",
@@ -2735,6 +2765,7 @@ async def config_console(
     request: Request,
     auth_token: Optional[str] = Query(default=None),
     edit_agent: Optional[str] = Query(default=None),
+    edit_assist_helper: Optional[str] = Query(default=None),
     edit_resource_id: int = Query(default=0),
     message: str = Query(default=""),
 ) -> HTMLResponse:
@@ -2744,6 +2775,37 @@ async def config_console(
     resource_items = list_resource_items()
     selected_agent = get_agent_profile(edit_agent or "") or blank_agent_profile()
     selected_resource = get_resource_item(edit_resource_id) or blank_resource_item()
+    active_assists = list_active_assist_overrides()
+
+    assist_seed_helper = str(
+        edit_assist_helper or selected_agent.get("agent_id", "") or ""
+    ).strip()
+    selected_assist = (
+        get_active_assist_for_helper(assist_seed_helper) if assist_seed_helper else None
+    )
+    assist_form = {
+        "helper_agent_id": "",
+        "target_agent_id": "",
+        "region": "",
+        "delegate_start": "",
+        "delegate_end": "",
+    }
+    if selected_assist:
+        assist_form = {
+            "helper_agent_id": str(selected_assist.get("helper_agent_id", "") or ""),
+            "target_agent_id": str(selected_assist.get("target_agent_id", "") or ""),
+            "region": str(selected_assist.get("region", "") or ""),
+            "delegate_start": parse_int(selected_assist.get("delegate_start"), 0),
+            "delegate_end": parse_int(selected_assist.get("delegate_end"), 0),
+        }
+    elif selected_agent.get("agent_id"):
+        assist_form = {
+            "helper_agent_id": str(selected_agent.get("agent_id", "") or ""),
+            "target_agent_id": "",
+            "region": str(selected_agent.get("region", "") or ""),
+            "delegate_start": "",
+            "delegate_end": "",
+        }
 
     return templates.TemplateResponse(
         "config_console.html",
@@ -2757,13 +2819,101 @@ async def config_console(
             "resource_items": resource_items,
             "selected_agent": selected_agent,
             "selected_resource": selected_resource,
+            "active_assists": active_assists,
+            "selected_assist": selected_assist or {},
+            "assist_form": assist_form,
             "dashboard_url": append_query_params("/", auth_token=auth_token),
             "resources_console_url": append_query_params(
                 "/console/resources", auth_token=auth_token
             ),
             "agent_profile_count": len(agent_profiles),
             "resource_item_count": len(resource_items),
+            "active_assist_count": len(active_assists),
         },
+    )
+
+
+@app.post("/console/assist/save")
+async def console_assist_save(
+    request: Request,
+    auth_token: Optional[str] = Query(default=None),
+) -> RedirectResponse:
+    ensure_auth(None, auth_token)
+    form = await parse_request_form_data(request)
+
+    helper_agent_id = str(form.get("helper_agent_id", "")).strip()
+    target_agent_id = str(form.get("target_agent_id", "")).strip()
+    region = str(form.get("region", "")).strip()
+    delegate_start = max(0, parse_int(form.get("delegate_start", 0), 0))
+    delegate_end = max(0, parse_int(form.get("delegate_end", 0), 0))
+
+    if not helper_agent_id or not target_agent_id:
+        return RedirectResponse(
+            build_console_redirect_url(
+                auth_token,
+                "缺少 helper Agent 或 target Agent",
+                edit_assist_helper=helper_agent_id or None,
+            ),
+            status_code=303,
+        )
+
+    try:
+        upsert_assist_override(
+            AssistAssignPayload(
+                helper_agent_id=helper_agent_id,
+                target_agent_id=target_agent_id,
+                region=region,
+                delegate_start=delegate_start,
+                delegate_end=delegate_end,
+            )
+        )
+    except ValueError as exc:
+        return RedirectResponse(
+            build_console_redirect_url(
+                auth_token,
+                str(exc),
+                edit_assist_helper=helper_agent_id,
+            ),
+            status_code=303,
+        )
+
+    return RedirectResponse(
+        build_console_redirect_url(
+            auth_token,
+            f"协助任务已保存: {helper_agent_id} -> {target_agent_id}",
+            edit_assist_helper=helper_agent_id,
+        ),
+        status_code=303,
+    )
+
+
+@app.post("/console/assist/clear")
+async def console_assist_clear(
+    request: Request,
+    auth_token: Optional[str] = Query(default=None),
+) -> RedirectResponse:
+    ensure_auth(None, auth_token)
+    form = await parse_request_form_data(request)
+
+    helper_agent_id = str(form.get("helper_agent_id", "")).strip()
+    target_agent_id = str(form.get("target_agent_id", "")).strip()
+    if not helper_agent_id and not target_agent_id:
+        return RedirectResponse(
+            build_console_redirect_url(auth_token, "缺少 helper_agent_id 或 target_agent_id"),
+            status_code=303,
+        )
+
+    removed = clear_assist_override(
+        helper_agent_id=helper_agent_id,
+        target_agent_id=target_agent_id,
+    )
+    if removed > 0:
+        message = "协助任务已清除"
+    else:
+        message = "未找到可清除的协助任务"
+    return RedirectResponse(
+        build_console_redirect_url(auth_token, message),
+        status_code=303,
     )
 
 
@@ -3456,3 +3606,4 @@ if __name__ == "__main__":
         port=settings.listen_port,
         reload=False,
     )
+

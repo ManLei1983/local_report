@@ -1,4 +1,4 @@
-<!doctype html>
+﻿<!doctype html>
 <html lang="zh-CN">
 <head>
 <meta charset="utf-8">
@@ -7,24 +7,29 @@
 <style>
 *{box-sizing:border-box}
 body{margin:0;background:#f4f7fb;color:#122033;font:14px "Segoe UI","Microsoft YaHei",sans-serif}
-.page{max-width:1400px;margin:0 auto;padding:20px}
-.card{background:#fff;border:1px solid #d9e2ec;border-radius:16px;padding:16px;margin-bottom:16px}
-.top,.row,.actions,.checks{display:flex;gap:10px;flex-wrap:wrap}
+.page{max-width:1440px;margin:0 auto;padding:20px}
+.card{background:#fff;border:1px solid #d9e2ec;border-radius:16px;padding:16px;margin-bottom:16px;box-shadow:0 10px 24px rgba(15,23,42,.05)}
+.top,.row,.actions,.checks,.inline-actions{display:flex;gap:10px;flex-wrap:wrap}
 .top{justify-content:space-between;align-items:flex-start}
-.grid{display:grid;grid-template-columns:minmax(320px,380px) minmax(0,1fr);gap:16px;align-items:start}
+.grid{display:grid;grid-template-columns:minmax(320px,420px) minmax(0,1fr);gap:16px;align-items:start}
+.split{display:grid;grid-template-columns:minmax(360px,1fr) minmax(360px,1fr);gap:16px;align-items:start}
 .fields{display:grid;gap:12px}
 .fields>*{min-width:0}
 .two{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px;align-items:start}
 .two>*{min-width:0}
+.three{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px;align-items:start}
+.three>*{min-width:0}
 .btn{display:inline-flex;align-items:center;justify-content:center;padding:8px 12px;border:1px solid #b8c5d6;border-radius:10px;background:#fff;color:#122033;text-decoration:none;cursor:pointer}
+.btn:hover{background:#f8fbff}
 .primary{background:#1d4ed8;border-color:#1d4ed8;color:#fff}
+.primary:hover{background:#1842b8}
 .danger{background:#fff1f1;border-color:#ef4444;color:#b42318}
 .msg{padding:10px 12px;border:1px solid #cfe0ff;background:#eaf2ff;border-radius:12px;margin:16px 0}
 .pill{padding:6px 10px;border:1px solid #d9e2ec;border-radius:999px;background:#fff;color:#5a6b7f}
 .hint{color:#5a6b7f;line-height:1.6}
 .checks{align-items:stretch}
 .checks label,.inline-check{display:flex;align-items:center;gap:8px;width:100%;min-height:44px;padding:10px 12px;border:1px solid #d9e2ec;border-radius:12px;background:#f8fbff;line-height:1.4}
-.fields>.two>label,.fields>label{display:grid;gap:6px;color:#5a6b7f;min-width:0}
+.fields>.two>label,.fields>.three>label,.fields>label{display:grid;gap:6px;color:#5a6b7f;min-width:0}
 input[type="text"],input[type="number"],input[type="time"],select,textarea{display:block;width:100%;max-width:100%;padding:10px 12px;border:1px solid #b8c5d6;border-radius:10px;background:#fff;color:#122033;font:14px inherit}
 input[type="checkbox"]{width:16px;height:16px;min-width:16px;flex:0 0 16px;margin:0;padding:0}
 textarea{min-height:110px;resize:vertical;font-family:Consolas,"Courier New",monospace}
@@ -34,7 +39,10 @@ th,td{padding:10px 8px;border-bottom:1px solid #d9e2ec;text-align:left;vertical-
 th{font-size:13px;color:#5a6b7f;background:#f8fbff}
 tr.active td{background:#f5f9ff}
 .table{overflow:auto}
-@media (max-width:980px){.grid,.two{grid-template-columns:1fr}}
+.small{font-size:12px;color:#5a6b7f;line-height:1.5}
+.section-title{margin:0 0 8px}
+.subtle{background:#f8fbff;border:1px solid #d9e2ec;border-radius:14px;padding:14px}
+@media (max-width:1100px){.grid,.split,.two,.three{grid-template-columns:1fr}}
 </style>
 </head>
 <body>
@@ -42,37 +50,154 @@ tr.active td{background:#f5f9ff}
   <div class="card top">
     <div>
       <h1 style="margin:0 0 8px">Agent 控制台</h1>
-      <div class="hint">这里只保留任务范围、自动重启和 qiannian UI 设置。资源单独放到资源控制台。</div>
+      <div class="hint">这里保留每日主配置入口。Agent 任务范围、自动恢复和 qiannian UI 设置都在这里维护；临时协助任务也可以在本页直接下发。</div>
     </div>
     <div class="actions">
-      <a class="btn" href="{{ dashboard_url }}">状态看板</a>
+      <a class="btn" href="{{ dashboard_url }}">返回状态页</a>
       <a class="btn" href="{{ resources_console_url }}">资源控制台</a>
     </div>
   </div>
+
   {% if message %}<div class="msg">{{ message }}</div>{% endif %}
+
   <div class="row" style="margin-bottom:16px">
-    <span class="pill">Agent: {{ agent_profile_count }}</span>
-    <span class="pill">资源: {{ resource_item_count }}</span>
-    <span class="pill">当前: {{ selected_agent.agent_id or '新建 Agent' }}</span>
+    <span class="pill">Agent：{{ agent_profile_count }}</span>
+    <span class="pill">资源：{{ resource_item_count }}</span>
+    <span class="pill">临时协助：{{ active_assist_count }}</span>
+    <span class="pill">当前编辑：{{ selected_agent.agent_id or '新建 Agent' }}</span>
   </div>
+
+  <div class="card">
+    <div class="top" style="margin-bottom:12px">
+      <div>
+        <h2 class="section-title">临时协助任务</h2>
+        <div class="hint">用于临时让空闲 VM 接手另一台 VM 的尾段任务。保存后不会改动原始 Agent 配置，只会改变当天的有效任务范围。</div>
+      </div>
+    </div>
+    <div class="split">
+      <div>
+        <div class="table">
+          <table>
+            <thead>
+              <tr>
+                <th>Helper</th>
+                <th>Target</th>
+                <th>区服</th>
+                <th>接手范围</th>
+                <th>目标今日有效结束组</th>
+                <th></th>
+              </tr>
+            </thead>
+            <tbody>
+            {% for assist in active_assists %}
+              <tr>
+                <td>
+                  <strong>{{ assist.helper_agent_id }}</strong>
+                  <div class="small">{{ assist.helper_summary }}</div>
+                </td>
+                <td>
+                  <strong>{{ assist.target_agent_id }}</strong>
+                  <div class="small">{{ assist.target_summary }}</div>
+                </td>
+                <td>{{ assist.region or '-' }}</td>
+                <td>{{ assist.delegate_start }} -> {{ assist.delegate_end }}</td>
+                <td>{{ assist.effective_target_group_end }}</td>
+                <td>
+                  <div class="inline-actions">
+                    <form method="get" action="/console">
+                      <input type="hidden" name="auth_token" value="{{ auth_token }}">
+                      <input type="hidden" name="edit_assist_helper" value="{{ assist.helper_agent_id }}">
+                      <button class="btn" type="submit">编辑</button>
+                    </form>
+                    <form method="post" action="/console/assist/clear{{ auth_query_suffix }}" onsubmit="return confirm('确认清除这条临时协助任务吗？');">
+                      <input type="hidden" name="helper_agent_id" value="{{ assist.helper_agent_id }}">
+                      <input type="hidden" name="target_agent_id" value="{{ assist.target_agent_id }}">
+                      <button class="btn danger" type="submit">清除</button>
+                    </form>
+                  </div>
+                </td>
+              </tr>
+            {% else %}
+              <tr><td colspan="6">今天还没有临时协助任务。</td></tr>
+            {% endfor %}
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      <div class="subtle">
+        <h3 style="margin:0 0 8px">{{ selected_assist and '编辑临时协助任务' or '新建临时协助任务' }}</h3>
+        <div class="hint" style="margin-bottom:12px">第一版只支持尾段接手：`delegate_end` 必须等于目标 Agent 的原始 `group_end`。例如 `VM-1-1 -> VM-3-1, 91 -> 104`。</div>
+        <form method="post" action="/console/assist/save{{ auth_query_suffix }}">
+          <div class="fields">
+            <div class="two">
+              <label>
+                Helper Agent
+                <select name="helper_agent_id" required>
+                  <option value="">请选择</option>
+                  {% for agent in agent_profiles %}
+                    <option value="{{ agent.agent_id }}" {% if assist_form.helper_agent_id == agent.agent_id %}selected{% endif %}>{{ agent.agent_id }}{% if agent.region %} / {{ agent.region }}{% endif %}</option>
+                  {% endfor %}
+                </select>
+              </label>
+              <label>
+                目标 Agent
+                <select name="target_agent_id" required>
+                  <option value="">请选择</option>
+                  {% for agent in agent_profiles %}
+                    <option value="{{ agent.agent_id }}" {% if assist_form.target_agent_id == agent.agent_id %}selected{% endif %}>{{ agent.agent_id }}{% if agent.region %} / {{ agent.region }}{% endif %} / {{ agent.group_start }} -> {{ agent.group_end }}</option>
+                  {% endfor %}
+                </select>
+              </label>
+            </div>
+            <div class="three">
+              <label>区服<input type="text" name="region" value="{{ assist_form.region }}" placeholder="例如 103区"></label>
+              <label>接手开始组<input type="number" name="delegate_start" value="{{ assist_form.delegate_start }}" min="0"></label>
+              <label>接手结束组<input type="number" name="delegate_end" value="{{ assist_form.delegate_end }}" min="0"></label>
+            </div>
+          </div>
+          <div class="actions" style="margin-top:16px">
+            <button class="btn primary" type="submit">保存临时协助任务</button>
+          </div>
+        </form>
+        {% if assist_form.helper_agent_id %}
+        <form method="post" action="/console/assist/clear{{ auth_query_suffix }}" onsubmit="return confirm('确认清除当前表单对应的临时协助任务吗？');" style="margin-top:12px">
+          <input type="hidden" name="helper_agent_id" value="{{ assist_form.helper_agent_id }}">
+          <input type="hidden" name="target_agent_id" value="{{ assist_form.target_agent_id }}">
+          <button class="btn danger" type="submit">清除当前表单协助任务</button>
+        </form>
+        {% endif %}
+      </div>
+    </div>
+  </div>
+
   <div class="grid">
     <div class="card">
       <div class="top" style="margin-bottom:12px">
-        <h2 style="margin:0">Agent 列表</h2>
-        <form method="get" action="/console"><input type="hidden" name="auth_token" value="{{ auth_token }}"><button class="btn" type="submit">新建空白</button></form>
+        <h2 class="section-title">Agent 列表</h2>
+        <form method="get" action="/console">
+          <input type="hidden" name="auth_token" value="{{ auth_token }}">
+          <button class="btn" type="submit">新建空白</button>
+        </form>
       </div>
-      <div class="hint" style="margin-bottom:12px">主页面不再展示资源和 EXE 下载字段，避免日常配置被干扰。</div>
+      <div class="hint" style="margin-bottom:12px">日常配置只保留主流程需要的字段，避免把资源、下载和临时状态混在一起。</div>
       <div class="table">
         <table>
           <thead><tr><th>Agent</th><th>区服</th><th>组范围</th><th>状态</th><th></th></tr></thead>
           <tbody>
           {% for agent in agent_profiles %}
             <tr class="{% if agent.agent_id == selected_agent.agent_id %}active{% endif %}">
-              <td><strong>{{ agent.agent_id }}</strong><br><span class="hint">{{ agent.updated_at or '-' }}</span></td>
+              <td><strong>{{ agent.agent_id }}</strong><br><span class="small">{{ agent.updated_at or '-' }}</span></td>
               <td>{{ agent.region or '-' }}</td>
               <td>{{ agent.group_start }} -> {{ agent.group_end }}</td>
               <td>{{ '启用' if agent.enabled else '停用' }} / {{ agent.desired_run_state }}</td>
-              <td><form method="get" action="/console"><input type="hidden" name="auth_token" value="{{ auth_token }}"><input type="hidden" name="edit_agent" value="{{ agent.agent_id }}"><button class="btn" type="submit">编辑</button></form></td>
+              <td>
+                <form method="get" action="/console">
+                  <input type="hidden" name="auth_token" value="{{ auth_token }}">
+                  <input type="hidden" name="edit_agent" value="{{ agent.agent_id }}">
+                  <button class="btn" type="submit">编辑</button>
+                </form>
+              </td>
             </tr>
           {% else %}
             <tr><td colspan="5">还没有 Agent 配置。</td></tr>
@@ -81,9 +206,10 @@ tr.active td{background:#f5f9ff}
         </table>
       </div>
     </div>
+
     <div>
       <div class="card">
-        <h2 style="margin-top:0">{{ selected_agent.agent_id and '编辑 Agent' or '新建 Agent' }}</h2>
+        <h2 class="section-title">{{ selected_agent.agent_id and '编辑 Agent' or '新建 Agent' }}</h2>
         <form method="post" action="/console/agents/save{{ auth_query_suffix }}">
           <input type="hidden" name="original_agent_id" value="{{ selected_agent.agent_id }}">
           <textarea class="hide" name="config_payload_original">{{ selected_agent.config_payload_original }}</textarea>
@@ -96,8 +222,14 @@ tr.active td{background:#f5f9ff}
               </div>
             </div>
             <div class="two">
-              <label>区服<input type="text" name="region" value="{{ selected_agent.region }}" placeholder="例如 103 或 97区"></label>
-              <label>运行状态<select name="desired_run_state"><option value="run" {% if selected_agent.desired_run_state == 'run' %}selected{% endif %}>run</option><option value="stop" {% if selected_agent.desired_run_state == 'stop' %}selected{% endif %}>stop</option></select></label>
+              <label>区服<input type="text" name="region" value="{{ selected_agent.region }}" placeholder="例如 103区 或 97区"></label>
+              <label>
+                运行状态
+                <select name="desired_run_state">
+                  <option value="run" {% if selected_agent.desired_run_state == 'run' %}selected{% endif %}>run</option>
+                  <option value="stop" {% if selected_agent.desired_run_state == 'stop' %}selected{% endif %}>stop</option>
+                </select>
+              </label>
             </div>
             <div class="two">
               <label>起始组<input type="number" name="group_start" value="{{ selected_agent.group_start }}" min="0"></label>
@@ -107,7 +239,7 @@ tr.active td{background:#f5f9ff}
               <label>每日启动时间<input type="time" name="schedule_daily_start" value="{{ selected_agent.schedule_daily_start }}"></label>
               <div>
                 <div style="color:#5a6b7f;font-size:13px;margin-bottom:6px">自动重启</div>
-                <label class="inline-check"><input type="checkbox" name="auto_restart_on_stale" {% if selected_agent.auto_restart_on_stale %}checked{% endif %}>上报超时自动恢复</label>
+                <label class="inline-check"><input type="checkbox" name="auto_restart_on_stale" {% if selected_agent.auto_restart_on_stale %}checked{% endif %}>上报超时后自动恢复</label>
               </div>
             </div>
             <div class="two">
@@ -119,12 +251,22 @@ tr.active td{background:#f5f9ff}
               <label>备注<input type="text" name="notes" value="{{ selected_agent.notes }}"></label>
             </div>
           </div>
+
           <div class="card" style="margin:16px 0 0;padding:14px;box-shadow:none">
             <h3 style="margin:0 0 8px">qiannian UI 设置</h3>
             <div class="hint" style="margin-bottom:12px">这里控制 game_tool 启动后如何填写 qiannian 的控件。常用项直接勾选，不再手写整段 JSON。</div>
             <div class="fields">
               <div class="two">
-                <label>启动后按钮<select name="ui_launch_button"><option value="" {% if not selected_agent.ui_launch_button %}selected{% endif %}>跟随 game_tool 默认</option><option value="none" {% if selected_agent.ui_launch_button == 'none' %}selected{% endif %}>none 不点任务按钮</option><option value="gongzi" {% if selected_agent.ui_launch_button == 'gongzi' %}selected{% endif %}>gongzi</option><option value="runtask" {% if selected_agent.ui_launch_button == 'runtask' %}selected{% endif %}>runtask</option><option value="start" {% if selected_agent.ui_launch_button == 'start' %}selected{% endif %}>start</option></select></label>
+                <label>
+                  启动后按钮
+                  <select name="ui_launch_button">
+                    <option value="" {% if not selected_agent.ui_launch_button %}selected{% endif %}>跟随 game_tool 默认</option>
+                    <option value="none" {% if selected_agent.ui_launch_button == 'none' %}selected{% endif %}>none 不点任务按钮</option>
+                    <option value="gongzi" {% if selected_agent.ui_launch_button == 'gongzi' %}selected{% endif %}>gongzi</option>
+                    <option value="runtask" {% if selected_agent.ui_launch_button == 'runtask' %}selected{% endif %}>runtask</option>
+                    <option value="start" {% if selected_agent.ui_launch_button == 'start' %}selected{% endif %}>start</option>
+                  </select>
+                </label>
                 <label>角色索引 selorder<input type="number" name="ui_role_index" value="{{ selected_agent.ui_role_index }}" min="0"></label>
               </div>
               <div class="checks">
@@ -135,15 +277,24 @@ tr.active td{background:#f5f9ff}
               </div>
             </div>
           </div>
-          <details style="margin-top:16px"><summary>高级 JSON 扩展</summary><div class="hint" style="margin:8px 0">这里只放还没表单化的少量字段。不要再写 region、group_start、group_end。</div><textarea name="config_payload_extra">{{ selected_agent.config_payload_extra }}</textarea></details>
+
+          <details style="margin-top:16px">
+            <summary>高级 JSON 扩展</summary>
+            <div class="hint" style="margin:8px 0">这里只放还没表单化的少量字段，不要再重复写 `region`、`group_start`、`group_end`。</div>
+            <textarea name="config_payload_extra">{{ selected_agent.config_payload_extra }}</textarea>
+          </details>
           <div class="actions" style="margin-top:16px"><button class="btn primary" type="submit">保存 Agent 配置</button></div>
         </form>
       </div>
+
       {% if selected_agent.agent_id %}
       <div class="card">
         <h3 style="margin-top:0">删除当前 Agent</h3>
-        <div class="hint" style="margin-bottom:12px">删除只移除这条 Agent 配置，不影响已同步到 VM 本地的缓存文件。</div>
-        <form method="post" action="/console/agents/delete{{ auth_query_suffix }}" onsubmit="return confirm('确认删除当前 Agent 配置吗？');"><input type="hidden" name="agent_id" value="{{ selected_agent.agent_id }}"><button class="btn danger" type="submit">删除 {{ selected_agent.agent_id }}</button></form>
+        <div class="hint" style="margin-bottom:12px">删除只会移除这条 Agent 配置，不影响已经同步到 VM 本地的缓存文件。</div>
+        <form method="post" action="/console/agents/delete{{ auth_query_suffix }}" onsubmit="return confirm('确认删除当前 Agent 配置吗？');">
+          <input type="hidden" name="agent_id" value="{{ selected_agent.agent_id }}">
+          <button class="btn danger" type="submit">删除 {{ selected_agent.agent_id }}</button>
+        </form>
       </div>
       {% endif %}
     </div>
