@@ -5,6 +5,9 @@
                 <td>
                     <strong>{{ r.agent_id }}</strong>
                     <div class="small">{{ r.event }}</div>
+                    {% if r.assist_active and r.assist_summary %}
+                        <div class="small">{{ r.assist_summary }}</div>
+                    {% endif %}
                 </td>
                 <td>{{ r.region or '-' }}</td>
                 <td>

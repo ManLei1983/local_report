@@ -194,6 +194,19 @@ class AgentHeartbeatPayload(BaseModel):
     restart_count_today: int = 0
 
 
+class AssistAssignPayload(BaseModel):
+    target_agent_id: str = Field(min_length=1, max_length=128)
+    helper_agent_id: str = Field(min_length=1, max_length=128)
+    region: str = Field(default="")
+    delegate_start: int = 0
+    delegate_end: int = 0
+
+
+class AssistClearPayload(BaseModel):
+    target_agent_id: str = Field(default="")
+    helper_agent_id: str = Field(default="")
+
+
 app = FastAPI(title=settings.app_name)
 templates = Jinja2Templates(directory=str(RESOURCE_DIR / "templates"))
 
@@ -342,6 +355,32 @@ def init_db() -> None:
         )
         db_conn.execute(
             """
+            CREATE TABLE IF NOT EXISTS agent_assist_overrides (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                work_date TEXT NOT NULL,
+                target_agent_id TEXT NOT NULL,
+                helper_agent_id TEXT NOT NULL,
+                region TEXT DEFAULT '',
+                delegate_start INTEGER NOT NULL DEFAULT 0,
+                delegate_end INTEGER NOT NULL DEFAULT 0,
+                original_target_group_end INTEGER NOT NULL DEFAULT 0,
+                effective_target_group_end INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+        db_conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_assist_target_date ON agent_assist_overrides(work_date, target_agent_id)"
+        )
+        db_conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_assist_helper_date ON agent_assist_overrides(work_date, helper_agent_id)"
+        )
+        db_conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_assist_work_date ON agent_assist_overrides(work_date)"
+        )
+        db_conn.execute(
+            """
             CREATE TABLE IF NOT EXISTS resource_items (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 name TEXT NOT NULL UNIQUE,
@@ -396,6 +435,11 @@ def maybe_cleanup_db() -> None:
         with db_conn:
             if not settings.persist_reports:
                 db_conn.execute("DELETE FROM reports")
+            cutoff_date = (today - dt.timedelta(days=max(settings.db_clean_interval_days, 1))).isoformat()
+            db_conn.execute(
+                "DELETE FROM agent_assist_overrides WHERE work_date < ?",
+                (cutoff_date,),
+            )
             db_conn.execute(
                 "INSERT INTO meta(k, v) VALUES('last_clean_date', ?) "
                 "ON CONFLICT(k) DO UPDATE SET v=excluded.v",
@@ -759,7 +803,8 @@ def get_completion_state(
     agent_profile: Optional[Dict[str, Any]],
     report_item: Optional[Dict[str, Any]],
 ) -> Dict[str, Any]:
-    group_end = max(0, parse_int((agent_profile or {}).get("group_end"), 0))
+    task_context = build_agent_task_context(agent_profile)
+    group_end = max(0, parse_int(task_context.get("group_end"), 0))
     complete_role_index = get_agent_complete_role_index(agent_profile)
     if not report_item:
         return {
@@ -851,6 +896,8 @@ def build_agent_runtime_snapshot(agent_id: str) -> Dict[str, Any]:
         item = dict(agent_states.get(agent_id, {}))
         heartbeat_item = dict(heartbeat_states.get(agent_id, {}))
 
+    agent_profile = get_agent_profile(agent_id)
+    task_context = build_agent_task_context(agent_profile)
     if not item:
         return {
             "has_report": False,
@@ -867,12 +914,12 @@ def build_agent_runtime_snapshot(agent_id: str) -> Dict[str, Any]:
             "role_index": 0,
             "event": "",
             "completed": False,
-            "target_group_end": max(0, parse_int((get_agent_profile(agent_id) or {}).get("group_end"), 0)),
-            "complete_role_index": get_agent_complete_role_index(get_agent_profile(agent_id)),
+            "target_group_end": max(0, parse_int(task_context.get("group_end"), 0)),
+            "complete_role_index": get_agent_complete_role_index(agent_profile),
             "completion_basis": "no_report",
+            "assist": task_context.get("assist", build_assist_view(None)),
         }
 
-    agent_profile = get_agent_profile(agent_id)
     completion_state = get_completion_state(agent_profile, item)
     elapsed = int(max(0, now_ts - float(item.get("server_epoch", 0))))
     result_stale = False if completion_state["completed"] else elapsed > settings.alert_timeout_seconds
@@ -903,6 +950,7 @@ def build_agent_runtime_snapshot(agent_id: str) -> Dict[str, Any]:
         "target_group_end": completion_state["target_group_end"],
         "complete_role_index": completion_state["complete_role_index"],
         "completion_basis": completion_state["completion_basis"],
+        "assist": task_context.get("assist", build_assist_view(None)),
     }
 
 
@@ -1661,6 +1709,380 @@ def delete_agent_profile(agent_id: str) -> int:
             return cur.rowcount
 
 
+def row_to_assist_override(row: sqlite3.Row) -> Dict[str, Any]:
+    return {
+        "id": row["id"],
+        "work_date": row["work_date"],
+        "target_agent_id": row["target_agent_id"],
+        "helper_agent_id": row["helper_agent_id"],
+        "region": row["region"] or "",
+        "delegate_start": parse_int(row["delegate_start"], 0),
+        "delegate_end": parse_int(row["delegate_end"], 0),
+        "original_target_group_end": parse_int(
+            row["original_target_group_end"], 0
+        ),
+        "effective_target_group_end": parse_int(
+            row["effective_target_group_end"], 0
+        ),
+        "created_at": row["created_at"],
+        "updated_at": row["updated_at"],
+    }
+
+
+def get_active_assist_for_target(
+    agent_id: str,
+    work_date: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
+    if not db_conn or not agent_id:
+        return None
+    effective_date = str(work_date or today_str())
+    with db_lock:
+        row = db_conn.execute(
+            """
+            SELECT id, work_date, target_agent_id, helper_agent_id, region,
+                   delegate_start, delegate_end,
+                   original_target_group_end, effective_target_group_end,
+                   created_at, updated_at
+            FROM agent_assist_overrides
+            WHERE work_date = ? AND target_agent_id = ?
+            """,
+            (effective_date, agent_id),
+        ).fetchone()
+    return row_to_assist_override(row) if row else None
+
+
+def get_active_assist_for_helper(
+    agent_id: str,
+    work_date: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
+    if not db_conn or not agent_id:
+        return None
+    effective_date = str(work_date or today_str())
+    with db_lock:
+        row = db_conn.execute(
+            """
+            SELECT id, work_date, target_agent_id, helper_agent_id, region,
+                   delegate_start, delegate_end,
+                   original_target_group_end, effective_target_group_end,
+                   created_at, updated_at
+            FROM agent_assist_overrides
+            WHERE work_date = ? AND helper_agent_id = ?
+            """,
+            (effective_date, agent_id),
+        ).fetchone()
+    return row_to_assist_override(row) if row else None
+
+
+def build_assist_view(
+    assist_row: Optional[Dict[str, Any]],
+    role: str = "",
+) -> Dict[str, Any]:
+    if not assist_row:
+        return {
+            "active": False,
+            "role": "",
+            "summary": "",
+        }
+    helper_agent_id = str(assist_row.get("helper_agent_id", "") or "")
+    target_agent_id = str(assist_row.get("target_agent_id", "") or "")
+    delegate_start = parse_int(assist_row.get("delegate_start"), 0)
+    delegate_end = parse_int(assist_row.get("delegate_end"), 0)
+    effective_group_end = parse_int(
+        assist_row.get("effective_target_group_end"), 0
+    )
+    region = str(assist_row.get("region", "") or "")
+    if role == "helper":
+        summary = (
+            f"\u534f\u52a9 {target_agent_id} \u5c3e\u6bb5 {delegate_start}->{delegate_end}"
+            + (f" / \u533a\u670d {region}" if region else "")
+        )
+    elif role == "target":
+        summary = (
+            f"\u7531 {helper_agent_id} \u63a5\u624b {delegate_start}->{delegate_end}"
+            f"\uff0c\u4eca\u65e5\u6709\u6548\u7ed3\u675f\u7ec4 {effective_group_end}"
+        )
+    else:
+        summary = (
+            f"{helper_agent_id} -> {target_agent_id}"
+            f" {delegate_start}->{delegate_end}"
+        )
+    return {
+        **assist_row,
+        "active": True,
+        "role": role,
+        "summary": summary,
+    }
+
+
+def get_latest_agent_progress(agent_id: str) -> Dict[str, Any]:
+    progress_group = 0
+    role_index = 0
+    source = "none"
+    server_time = ""
+    with state_lock:
+        report_item = dict(agent_states.get(agent_id, {}))
+        heartbeat_item = dict(heartbeat_states.get(agent_id, {}))
+    if report_item:
+        progress_group = max(
+            progress_group,
+            parse_int(report_item.get("current_group"), 0),
+            parse_int(report_item.get("finished_group"), 0),
+        )
+        role_index = max(role_index, parse_int(report_item.get("role_index"), 0))
+        server_time = str(report_item.get("server_time", "") or server_time)
+        source = "memory_report"
+    if heartbeat_item:
+        heartbeat_group = parse_int(heartbeat_item.get("status_group"), 0)
+        heartbeat_role = parse_int(heartbeat_item.get("status_role_index"), 0)
+        if heartbeat_group > progress_group or (
+            heartbeat_group == progress_group and heartbeat_role > role_index
+        ):
+            progress_group = heartbeat_group
+            role_index = heartbeat_role
+            server_time = str(heartbeat_item.get("server_time", "") or server_time)
+            source = "heartbeat"
+    if progress_group > 0 or not db_conn or not settings.persist_reports:
+        return {
+            "group": progress_group,
+            "role_index": role_index,
+            "server_time": server_time,
+            "source": source,
+        }
+    with db_lock:
+        row = db_conn.execute(
+            """
+            SELECT current_group, finished_group, role_index, server_time
+            FROM reports
+            WHERE agent_id = ?
+            ORDER BY id DESC
+            LIMIT 1
+            """,
+            (agent_id,),
+        ).fetchone()
+    if not row:
+        return {
+            "group": progress_group,
+            "role_index": role_index,
+            "server_time": server_time,
+            "source": source,
+        }
+    progress_group = max(
+        progress_group,
+        parse_int(row["current_group"], 0),
+        parse_int(row["finished_group"], 0),
+    )
+    role_index = max(role_index, parse_int(row["role_index"], 0))
+    server_time = str(row["server_time"] or server_time)
+    source = "db_report"
+    return {
+        "group": progress_group,
+        "role_index": role_index,
+        "server_time": server_time,
+        "source": source,
+    }
+
+
+def validate_assist_region(target_region: str, requested_region: str) -> str:
+    target_text = str(target_region or "").strip()
+    requested_text = str(requested_region or "").strip()
+    if not requested_text:
+        return target_text
+    if not target_text:
+        return requested_text
+    target_number = extract_region_number(target_text)
+    requested_number = extract_region_number(requested_text)
+    if target_number is not None and requested_number is not None:
+        if target_number != requested_number:
+            raise ValueError(
+                f"\u533a\u670d {requested_text} \u4e0e\u76ee\u6807 Agent \u7684\u533a\u670d {target_text} \u4e0d\u4e00\u81f4"
+            )
+        return requested_text
+    if target_text != requested_text:
+        raise ValueError(
+            f"\u533a\u670d {requested_text} \u4e0e\u76ee\u6807 Agent \u7684\u533a\u670d {target_text} \u4e0d\u4e00\u81f4"
+        )
+    return requested_text
+
+
+def upsert_assist_override(payload: AssistAssignPayload) -> Dict[str, Any]:
+    if not db_conn:
+        raise ValueError("\u6570\u636e\u5e93\u672a\u521d\u59cb\u5316")
+    target_agent_id = str(payload.target_agent_id or "").strip()
+    helper_agent_id = str(payload.helper_agent_id or "").strip()
+    if not target_agent_id or not helper_agent_id:
+        raise ValueError("helper_agent_id \u548c target_agent_id \u90fd\u4e0d\u80fd\u4e3a\u7a7a")
+    if target_agent_id == helper_agent_id:
+        raise ValueError("helper_agent_id \u4e0d\u80fd\u4e0e target_agent_id \u76f8\u540c")
+
+    target_profile = get_agent_profile(target_agent_id)
+    helper_profile = get_agent_profile(helper_agent_id)
+    if not target_profile:
+        raise ValueError(f"\u76ee\u6807 Agent \u4e0d\u5b58\u5728: {target_agent_id}")
+    if not helper_profile:
+        raise ValueError(f"\u534f\u52a9 Agent \u4e0d\u5b58\u5728: {helper_agent_id}")
+
+    delegate_start = max(0, parse_int(payload.delegate_start, 0))
+    delegate_end = max(0, parse_int(payload.delegate_end, 0))
+    target_group_start = max(0, parse_int(target_profile.get("group_start"), 0))
+    target_group_end = max(0, parse_int(target_profile.get("group_end"), 0))
+    if delegate_start <= 0 or delegate_end <= 0:
+        raise ValueError("delegate_start \u548c delegate_end \u90fd\u5fc5\u987b\u5927\u4e8e 0")
+    if delegate_end < delegate_start:
+        raise ValueError("delegate_end \u4e0d\u80fd\u5c0f\u4e8e delegate_start")
+    if target_group_end <= 0:
+        raise ValueError("\u76ee\u6807 Agent \u672a\u914d\u7f6e\u6709\u6548\u7684\u7ed3\u675f\u7ec4")
+    if delegate_end != target_group_end:
+        raise ValueError(
+            f"\u7b2c\u4e00\u7248\u53ea\u652f\u6301\u5c3e\u6bb5\u63a5\u624b\uff0cdelegate_end \u5fc5\u987b\u7b49\u4e8e\u76ee\u6807\u7ed3\u675f\u7ec4 {target_group_end}"
+        )
+    if delegate_start <= target_group_start:
+        raise ValueError(
+            f"delegate_start \u5fc5\u987b\u5927\u4e8e\u76ee\u6807\u8d77\u59cb\u7ec4 {target_group_start}"
+        )
+
+    helper_active = get_active_assist_for_helper(helper_agent_id)
+    if helper_active and helper_active.get("target_agent_id") != target_agent_id:
+        raise ValueError(
+            f"\u534f\u52a9 Agent {helper_agent_id} \u4eca\u5929\u5df2\u7ecf\u5728\u534f\u52a9 {helper_active.get('target_agent_id')}"
+        )
+    target_active = get_active_assist_for_target(target_agent_id)
+    if target_active and target_active.get("helper_agent_id") != helper_agent_id:
+        raise ValueError(
+            f"\u76ee\u6807 Agent {target_agent_id} \u4eca\u5929\u5df2\u7ecf\u88ab {target_active.get('helper_agent_id')} \u63a5\u624b"
+        )
+
+    latest_progress = get_latest_agent_progress(target_agent_id)
+    if parse_int(latest_progress.get("group"), 0) >= delegate_start:
+        raise ValueError(
+            f"\u76ee\u6807 Agent {target_agent_id} \u5f53\u524d\u8fdb\u5ea6\u5df2\u5230 {latest_progress.get('group', 0)}\uff0c\u4e0d\u80fd\u518d\u5206\u914d {delegate_start}->{delegate_end}"
+        )
+
+    effective_group_end = delegate_start - 1
+    region = validate_assist_region(
+        str(target_profile.get("region", "") or ""),
+        str(payload.region or ""),
+    )
+    current_time = now_str()
+    work_date = today_str()
+
+    with db_lock:
+        with db_conn:
+            db_conn.execute(
+                "DELETE FROM agent_assist_overrides WHERE work_date = ? AND (target_agent_id = ? OR helper_agent_id = ?)",
+                (work_date, target_agent_id, helper_agent_id),
+            )
+            db_conn.execute(
+                """
+                INSERT INTO agent_assist_overrides (
+                    work_date, target_agent_id, helper_agent_id, region,
+                    delegate_start, delegate_end,
+                    original_target_group_end, effective_target_group_end,
+                    created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    work_date,
+                    target_agent_id,
+                    helper_agent_id,
+                    region,
+                    delegate_start,
+                    delegate_end,
+                    target_group_end,
+                    effective_group_end,
+                    current_time,
+                    current_time,
+                ),
+            )
+            row = db_conn.execute(
+                """
+                SELECT id, work_date, target_agent_id, helper_agent_id, region,
+                       delegate_start, delegate_end,
+                       original_target_group_end, effective_target_group_end,
+                       created_at, updated_at
+                FROM agent_assist_overrides
+                WHERE work_date = ? AND target_agent_id = ?
+                """,
+                (work_date, target_agent_id),
+            ).fetchone()
+    return row_to_assist_override(row)
+
+
+def clear_assist_override(
+    helper_agent_id: str = "",
+    target_agent_id: str = "",
+    work_date: Optional[str] = None,
+) -> int:
+    if not db_conn:
+        return 0
+    helper_agent_id = str(helper_agent_id or "").strip()
+    target_agent_id = str(target_agent_id or "").strip()
+    if not helper_agent_id and not target_agent_id:
+        return 0
+    effective_date = str(work_date or today_str())
+    clauses: List[str] = ["work_date = ?"]
+    params: List[Any] = [effective_date]
+    if helper_agent_id:
+        clauses.append("helper_agent_id = ?")
+        params.append(helper_agent_id)
+    if target_agent_id:
+        clauses.append("target_agent_id = ?")
+        params.append(target_agent_id)
+    sql = "DELETE FROM agent_assist_overrides WHERE " + " AND ".join(clauses)
+    with db_lock:
+        with db_conn:
+            cur = db_conn.execute(sql, tuple(params))
+            return cur.rowcount
+
+
+def build_agent_task_context(
+    agent_profile: Optional[Dict[str, Any]],
+    work_date: Optional[str] = None,
+) -> Dict[str, Any]:
+    profile = agent_profile or {}
+    profile_region = str(profile.get("region", "") or "")
+    profile_group_start = max(0, parse_int(profile.get("group_start"), 0))
+    profile_group_end = max(0, parse_int(profile.get("group_end"), 0))
+    context = {
+        "enabled": bool(profile.get("enabled", True)),
+        "region": profile_region,
+        "group_start": profile_group_start,
+        "group_end": profile_group_end,
+        "profile_group_start": profile_group_start,
+        "profile_group_end": profile_group_end,
+        "task_mode": str(profile.get("task_mode", "normal") or "normal"),
+        "priority": max(0, parse_int(profile.get("priority"), 0)),
+        "notes": str(profile.get("notes", "") or ""),
+        "assist": build_assist_view(None),
+    }
+    agent_id = str(profile.get("agent_id", "") or "")
+    if not agent_id:
+        return context
+    helper_assist = get_active_assist_for_helper(agent_id, work_date=work_date)
+    if helper_assist:
+        context["region"] = str(helper_assist.get("region", "") or context["region"])
+        context["group_start"] = max(
+            0, parse_int(helper_assist.get("delegate_start"), context["group_start"])
+        )
+        context["group_end"] = max(
+            0, parse_int(helper_assist.get("delegate_end"), context["group_end"])
+        )
+        context["assist"] = build_assist_view(helper_assist, role="helper")
+        return context
+    target_assist = get_active_assist_for_target(agent_id, work_date=work_date)
+    if target_assist:
+        if target_assist.get("region") and not context["region"]:
+            context["region"] = str(target_assist.get("region", "") or "")
+        context["group_end"] = max(
+            0,
+            parse_int(
+                target_assist.get("effective_target_group_end"),
+                context["group_end"],
+            ),
+        )
+        context["assist"] = build_assist_view(target_assist, role="target")
+    return context
+
+
 def resource_applies_to_agent(
     resource: Dict[str, Any], agent_id: Optional[str]
 ) -> bool:
@@ -1804,6 +2226,7 @@ def build_bootstrap_payload(
     agent_profile: Dict[str, Any],
     auth_token: Optional[str],
 ) -> Dict[str, Any]:
+    task_context = build_agent_task_context(agent_profile)
     manifest_url = append_query_params(
         str(request.url_for("api_resources_manifest")),
         agent_id=agent_profile["agent_id"],
@@ -1822,13 +2245,16 @@ def build_bootstrap_payload(
         "agent_id": agent_profile["agent_id"],
         "profile_version": agent_profile["profile_version"],
         "task": {
-            "enabled": agent_profile["enabled"],
-            "region": agent_profile["region"],
-            "group_start": agent_profile["group_start"],
-            "group_end": agent_profile["group_end"],
-            "task_mode": agent_profile["task_mode"],
-            "priority": agent_profile["priority"],
-            "notes": agent_profile["notes"],
+            "enabled": task_context["enabled"],
+            "region": task_context["region"],
+            "group_start": task_context["group_start"],
+            "group_end": task_context["group_end"],
+            "profile_group_start": task_context["profile_group_start"],
+            "profile_group_end": task_context["profile_group_end"],
+            "task_mode": task_context["task_mode"],
+            "priority": task_context["priority"],
+            "notes": task_context["notes"],
+            "assist": task_context["assist"],
         },
         "control": build_agent_control(agent_profile),
         "config": {
@@ -1841,6 +2267,7 @@ def build_bootstrap_payload(
             "startup_args": agent_profile["startup_args"],
             "script_entry": agent_profile["script_entry"],
         },
+        "assist": task_context["assist"],
         "downloads": {
             "exe": {
                 "version": agent_profile["exe_version"],
@@ -1896,6 +2323,7 @@ def build_rows() -> List[Dict[str, Any]]:
         report_item = report_values.get(agent_id)
         heartbeat_item = heartbeat_values.get(agent_id)
         agent_profile = profiles.get(str(agent_id), {})
+        task_context = build_agent_task_context(agent_profile)
 
         alert_snapshot = build_agent_runtime_snapshot(agent_id)
         result_snapshot = build_result_snapshot(agent_profile, report_item, now_ts=now_ts)
@@ -1908,6 +2336,7 @@ def build_rows() -> List[Dict[str, Any]]:
 
         region = str(
             (report_item or {}).get("region")
+            or task_context.get("region")
             or agent_profile.get("region")
             or ""
         ).strip()
@@ -1955,6 +2384,9 @@ def build_rows() -> List[Dict[str, Any]]:
                 "last_progress_change_at": heartbeat_snapshot["last_progress_change_at"],
                 "last_restart_at": heartbeat_snapshot["last_restart_at"],
                 "restart_count_today": heartbeat_snapshot["restart_count_today"],
+                "assist_active": bool(task_context.get("assist", {}).get("active", False)),
+                "assist_role": str(task_context.get("assist", {}).get("role", "") or ""),
+                "assist_summary": str(task_context.get("assist", {}).get("summary", "") or ""),
             }
         )
 
@@ -2670,6 +3102,7 @@ async def api_agent_control(
     if not agent_profile:
         raise HTTPException(status_code=404, detail="agent profile not found")
 
+    task_context = build_agent_task_context(agent_profile)
     with state_lock:
         heartbeat_item = dict(heartbeat_states.get(agent_profile["agent_id"], {}))
         report_item = dict(agent_states.get(agent_profile["agent_id"], {}))
@@ -2680,19 +3113,73 @@ async def api_agent_control(
         "agent_id": agent_profile["agent_id"],
         "profile_version": agent_profile["profile_version"],
         "task": {
-            "enabled": agent_profile["enabled"],
-            "region": agent_profile["region"],
-            "group_start": agent_profile["group_start"],
-            "group_end": agent_profile["group_end"],
-            "task_mode": agent_profile["task_mode"],
-            "priority": agent_profile["priority"],
+            "enabled": task_context["enabled"],
+            "region": task_context["region"],
+            "group_start": task_context["group_start"],
+            "group_end": task_context["group_end"],
+            "profile_group_start": task_context["profile_group_start"],
+            "profile_group_end": task_context["profile_group_end"],
+            "task_mode": task_context["task_mode"],
+            "priority": task_context["priority"],
+            "notes": task_context["notes"],
+            "assist": task_context["assist"],
         },
+        "assist": task_context["assist"],
         "control": build_agent_control(agent_profile),
         "runtime": build_agent_runtime_snapshot(agent_profile["agent_id"]),
         "heartbeat": build_heartbeat_snapshot(heartbeat_item),
         "supervision": build_supervision_snapshot(agent_profile, heartbeat_item),
         "result": build_result_snapshot(agent_profile, report_item),
         "updated_at": agent_profile["updated_at"],
+    }
+
+
+@app.post("/api/agent/assist/assign")
+async def api_agent_assist_assign(
+    payload: AssistAssignPayload,
+    x_auth_token: Optional[str] = Header(default=None),
+    auth_token: Optional[str] = Query(default=None),
+) -> Dict[str, Any]:
+    ensure_auth(x_auth_token, auth_token)
+    try:
+        assist_row = upsert_assist_override(payload)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    target_profile = get_agent_profile(str(assist_row.get("target_agent_id", "") or ""))
+    helper_profile = get_agent_profile(str(assist_row.get("helper_agent_id", "") or ""))
+    target_task = build_agent_task_context(target_profile)
+    helper_task = build_agent_task_context(helper_profile)
+    assist_view = build_assist_view(assist_row)
+    return {
+        "ok": True,
+        "server_time": now_str(),
+        "assist": assist_view,
+        "target_effective_group_end": max(
+            0, parse_int(target_task.get("group_end"), 0)
+        ),
+        "target_task": target_task,
+        "helper_task": helper_task,
+    }
+
+
+@app.post("/api/agent/assist/clear")
+async def api_agent_assist_clear(
+    payload: AssistClearPayload,
+    x_auth_token: Optional[str] = Header(default=None),
+    auth_token: Optional[str] = Query(default=None),
+) -> Dict[str, Any]:
+    ensure_auth(x_auth_token, auth_token)
+    removed = clear_assist_override(
+        helper_agent_id=payload.helper_agent_id,
+        target_agent_id=payload.target_agent_id,
+    )
+    return {
+        "ok": True,
+        "server_time": now_str(),
+        "removed": removed,
+        "target_agent_id": str(payload.target_agent_id or "").strip(),
+        "helper_agent_id": str(payload.helper_agent_id or "").strip(),
     }
 
 
