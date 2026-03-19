@@ -176,6 +176,24 @@ class RemoveAgentPayload(BaseModel):
     agent_id: str = Field(min_length=1, max_length=128)
 
 
+class AgentHeartbeatPayload(BaseModel):
+    agent_id: str = Field(min_length=1, max_length=128)
+    heartbeat_at: Optional[str] = None
+    intent: str = Field(default="none")
+    intent_reason: str = Field(default="")
+    intent_at: Optional[str] = None
+    process_exists: bool = False
+    process_pid: int = 0
+    status_exists: bool = False
+    status_group: int = 0
+    status_role_index: int = 0
+    status_date: str = Field(default="")
+    status_mtime_epoch: float = 0
+    last_progress_change_at: Optional[str] = None
+    last_restart_at: Optional[str] = None
+    restart_count_today: int = 0
+
+
 app = FastAPI(title=settings.app_name)
 templates = Jinja2Templates(directory=str(RESOURCE_DIR / "templates"))
 
@@ -190,6 +208,7 @@ async def ensure_utf8_charset(request: Request, call_next):
 
 state_lock = threading.Lock()
 agent_states: Dict[str, Dict[str, Any]] = {}
+heartbeat_states: Dict[str, Dict[str, Any]] = {}
 history_cache: deque = deque(maxlen=2000)
 stale_state: Dict[str, bool] = {}
 completed_state: Dict[str, bool] = {}
@@ -807,6 +826,7 @@ def ensure_runtime_state_for_today() -> None:
         agent_count = len(agent_states)
         history_count = len(history_cache)
         agent_states.clear()
+        heartbeat_states.clear()
         history_cache.clear()
         stale_state.clear()
         completed_state.clear()
@@ -869,6 +889,443 @@ def build_agent_runtime_snapshot(agent_id: str) -> Dict[str, Any]:
         "complete_role_index": completion_state["complete_role_index"],
         "completion_basis": completion_state["completion_basis"],
     }
+
+
+SUPERVISION_ISSUE_CODES = {"suspected_stuck", "startup_failed"}
+RESULT_ACTIVE_CODES = {"fresh", "stale", "completed"}
+DEFAULT_HEARTBEAT_MISSING_SECONDS = 90
+DEFAULT_PROGRESS_STALL_SECONDS = 900
+DEFAULT_GONGZI_PROGRESS_STALL_SECONDS = 1800
+INTENT_REASON_LABELS = {
+    "": "-",
+    "schedule": "定时启动",
+    "daily_schedule": "定时启动",
+    "daily_rollover": "跨天重启",
+    "manual_run": "手动启动",
+    "manual_restart": "手动重启",
+    "restart_once": "手动重启",
+    "start_once": "手动启动",
+    "report_stale": "结果超时后重启",
+    "startup_no_report": "启动后久未出结果",
+    "resume_pending_session": "按今日进度续跑",
+    "manual_stop": "手动停止",
+    "stop_once": "手动停止",
+    "manual_skip_today": "跳过今天",
+    "skip_today": "跳过今天",
+}
+
+
+def parse_datetime_text(value: Any) -> Optional[dt.datetime]:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    normalized = text.replace("T", " ")
+    if len(normalized) >= 19:
+        normalized = normalized[:19]
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M"):
+        try:
+            return dt.datetime.strptime(normalized, fmt)
+        except ValueError:
+            continue
+    return None
+
+
+def parse_hhmm_text(value: Any) -> Optional[tuple[int, int]]:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    match = re.fullmatch(r"(\d{1,2}):(\d{2})", text)
+    if not match:
+        return None
+    hour = int(match.group(1))
+    minute = int(match.group(2))
+    if hour > 23 or minute > 59:
+        return None
+    return hour, minute
+
+
+def get_supervision_overrides(agent_profile: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    if not agent_profile:
+        return {}
+    payload = parse_json_payload(str(agent_profile.get("config_payload", "")))
+    if not isinstance(payload, dict):
+        return {}
+    supervision = payload.get("supervision")
+    if isinstance(supervision, dict):
+        return supervision
+    return {}
+
+
+def get_supervision_thresholds(agent_profile: Optional[Dict[str, Any]]) -> Dict[str, int]:
+    profile = agent_profile or {}
+    control = build_agent_control(profile) if profile else {"startup_grace_seconds": 300}
+    overrides = get_supervision_overrides(agent_profile)
+    launch_button = str(profile.get("ui_launch_button", "")).strip().lower()
+    task_mode = str(profile.get("task_mode", "normal")).strip().lower()
+    default_progress_stall = (
+        DEFAULT_GONGZI_PROGRESS_STALL_SECONDS
+        if launch_button == "gongzi" or task_mode == "gongzi"
+        else DEFAULT_PROGRESS_STALL_SECONDS
+    )
+    progress_stall_seconds = max(
+        60,
+        parse_int(overrides.get("progress_stall_seconds"), default_progress_stall),
+    )
+    heartbeat_missing_seconds = max(
+        30,
+        parse_int(
+            overrides.get("heartbeat_missing_seconds"),
+            DEFAULT_HEARTBEAT_MISSING_SECONDS,
+        ),
+    )
+    return {
+        "startup_grace_seconds": max(
+            30,
+            parse_int(control.get("startup_grace_seconds"), 300),
+        ),
+        "progress_stall_seconds": progress_stall_seconds,
+        "heartbeat_missing_seconds": heartbeat_missing_seconds,
+        "report_timeout_seconds": max(1, settings.alert_timeout_seconds),
+    }
+
+def build_result_snapshot(
+    agent_profile: Optional[Dict[str, Any]],
+    report_item: Optional[Dict[str, Any]],
+    now_ts: Optional[float] = None,
+) -> Dict[str, Any]:
+    current_ts = time.time() if now_ts is None else now_ts
+    completion_state = get_completion_state(agent_profile, report_item)
+    report_timeout_seconds = max(1, settings.alert_timeout_seconds)
+    if not report_item:
+        return {
+            "has_report": False,
+            "state_code": "not_reported",
+            "state_label": "未上报",
+            "detail": "今天还没有收到组完成结果上报",
+            "elapsed": None,
+            "stale": False,
+            "completed": False,
+            "server_time": "",
+            "event": "",
+            "target_group_end": completion_state["target_group_end"],
+            "complete_role_index": completion_state["complete_role_index"],
+            "completion_basis": completion_state["completion_basis"],
+            "report_timeout_seconds": report_timeout_seconds,
+            "current_group": 0,
+            "finished_group": 0,
+            "next_group": 0,
+            "role_index": 0,
+        }
+
+    event = str(report_item.get("event", "") or "")
+    if event.startswith("recovering:"):
+        return {
+            "has_report": False,
+            "state_code": "not_reported",
+            "state_label": "未上报",
+            "detail": "当前处于恢复保护期，等待新的组完成结果",
+            "elapsed": None,
+            "stale": False,
+            "completed": False,
+            "server_time": report_item.get("server_time", ""),
+            "event": event,
+            "target_group_end": completion_state["target_group_end"],
+            "complete_role_index": completion_state["complete_role_index"],
+            "completion_basis": completion_state["completion_basis"],
+            "report_timeout_seconds": report_timeout_seconds,
+            "current_group": parse_int(report_item.get("current_group"), 0),
+            "finished_group": parse_int(report_item.get("finished_group"), 0),
+            "next_group": parse_int(report_item.get("next_group"), 0),
+            "role_index": parse_int(report_item.get("role_index"), 0),
+        }
+
+    elapsed = int(max(0, current_ts - float(report_item.get("server_epoch", 0))))
+    stale = False if completion_state["completed"] else elapsed > report_timeout_seconds
+    if completion_state["completed"]:
+        state_code = "completed"
+        state_label = "已完成"
+        detail = (
+            f"已达到结束组 {completion_state['target_group_end']}，角色阈值 {completion_state['complete_role_index']}"
+        )
+    elif stale:
+        state_code = "stale"
+        state_label = "结果超时"
+        detail = f"已超过 {report_timeout_seconds} 秒未收到新的组完成结果"
+    else:
+        state_code = "fresh"
+        state_label = "结果新鲜"
+        detail = f"最近 {elapsed} 秒内收到过有效结果"
+
+    return {
+        "has_report": True,
+        "state_code": state_code,
+        "state_label": state_label,
+        "detail": detail,
+        "elapsed": elapsed,
+        "stale": stale,
+        "completed": completion_state["completed"],
+        "server_time": report_item.get("server_time", ""),
+        "event": event,
+        "target_group_end": completion_state["target_group_end"],
+        "complete_role_index": completion_state["complete_role_index"],
+        "completion_basis": completion_state["completion_basis"],
+        "report_timeout_seconds": report_timeout_seconds,
+        "current_group": parse_int(report_item.get("current_group"), 0),
+        "finished_group": parse_int(report_item.get("finished_group"), 0),
+        "next_group": parse_int(report_item.get("next_group"), 0),
+        "role_index": parse_int(report_item.get("role_index"), 0),
+    }
+
+def build_heartbeat_snapshot(
+    heartbeat_item: Optional[Dict[str, Any]],
+    now_ts: Optional[float] = None,
+) -> Dict[str, Any]:
+    current_ts = time.time() if now_ts is None else now_ts
+    if not heartbeat_item:
+        return {
+            "has_heartbeat": False,
+            "server_time": "",
+            "server_epoch": 0,
+            "heartbeat_elapsed": None,
+            "intent": "none",
+            "intent_reason": "",
+            "intent_at": "",
+            "process_exists": False,
+            "process_pid": 0,
+            "status_exists": False,
+            "status_group": 0,
+            "status_role_index": 0,
+            "status_date": "",
+            "status_mtime_epoch": 0,
+            "last_progress_change_at": "",
+            "last_restart_at": "",
+            "restart_count_today": 0,
+        }
+
+    return {
+        "has_heartbeat": True,
+        "server_time": heartbeat_item.get("server_time", ""),
+        "server_epoch": float(heartbeat_item.get("server_epoch", 0) or 0),
+        "heartbeat_elapsed": int(
+            max(0, current_ts - float(heartbeat_item.get("server_epoch", 0) or 0))
+        ),
+        "intent": str(heartbeat_item.get("intent", "none") or "none"),
+        "intent_reason": str(heartbeat_item.get("intent_reason", "") or ""),
+        "intent_at": str(heartbeat_item.get("intent_at", "") or ""),
+        "process_exists": bool(heartbeat_item.get("process_exists", False)),
+        "process_pid": parse_int(heartbeat_item.get("process_pid"), 0),
+        "status_exists": bool(heartbeat_item.get("status_exists", False)),
+        "status_group": parse_int(heartbeat_item.get("status_group"), 0),
+        "status_role_index": parse_int(heartbeat_item.get("status_role_index"), 0),
+        "status_date": str(heartbeat_item.get("status_date", "") or ""),
+        "status_mtime_epoch": float(heartbeat_item.get("status_mtime_epoch", 0) or 0),
+        "last_progress_change_at": str(
+            heartbeat_item.get("last_progress_change_at", "") or ""
+        ),
+        "last_restart_at": str(heartbeat_item.get("last_restart_at", "") or ""),
+        "restart_count_today": max(
+            0,
+            parse_int(heartbeat_item.get("restart_count_today"), 0),
+        ),
+    }
+
+
+def describe_action_text(intent: str, reason: str) -> str:
+    reason_key = str(reason or "").strip()
+    reason_label = INTENT_REASON_LABELS.get(reason_key, reason_key or "-")
+    mapping = {
+        "start_requested": "启动请求",
+        "restart_requested": "重启请求",
+        "stop_requested": "停止请求",
+        "skip_today": "跳过今天",
+    }
+    prefix = mapping.get(str(intent or "").strip(), "")
+    if prefix and reason_label and reason_label != "-":
+        return f"{prefix} / {reason_label}"
+    if prefix:
+        return prefix
+    return reason_label if reason_label != "-" else "-"
+
+def build_supervision_snapshot(
+    agent_profile: Optional[Dict[str, Any]],
+    heartbeat_item: Optional[Dict[str, Any]],
+    now_ts: Optional[float] = None,
+) -> Dict[str, Any]:
+    current_ts = time.time() if now_ts is None else now_ts
+    now_dt = dt.datetime.fromtimestamp(current_ts)
+    profile = agent_profile or {}
+    thresholds = get_supervision_thresholds(agent_profile)
+    schedule_text = normalize_daily_start(profile.get("schedule_daily_start", ""))
+    schedule_hhmm = parse_hhmm_text(schedule_text)
+    schedule_due_today = False
+    if schedule_hhmm is not None:
+        due_dt = now_dt.replace(
+            hour=schedule_hhmm[0], minute=schedule_hhmm[1], second=0, microsecond=0
+        )
+        schedule_due_today = now_dt < due_dt
+
+    heartbeat = build_heartbeat_snapshot(heartbeat_item, now_ts=current_ts)
+    if not heartbeat["has_heartbeat"]:
+        if schedule_due_today:
+            return {
+                "state_code": "waiting_schedule",
+                "state_label": "等待定时",
+                "detail": f"今天计划在 {schedule_text} 启动，当前仍在等待",
+                "heartbeat_elapsed": None,
+                "action_text": "-",
+                "last_progress_change_at": "",
+            }
+        return {
+            "state_code": "stopped",
+            "state_label": "已停止",
+            "detail": "尚未收到 game_tool 的证据心跳",
+            "heartbeat_elapsed": None,
+            "action_text": "-",
+            "last_progress_change_at": "",
+        }
+
+    heartbeat_elapsed = heartbeat["heartbeat_elapsed"]
+    intent = heartbeat["intent"]
+    intent_reason = heartbeat["intent_reason"]
+    intent_dt = parse_datetime_text(heartbeat["intent_at"])
+    last_progress_dt = parse_datetime_text(heartbeat["last_progress_change_at"])
+    action_text = describe_action_text(intent, intent_reason)
+
+    if (
+        heartbeat_elapsed is not None
+        and heartbeat_elapsed > thresholds["heartbeat_missing_seconds"]
+    ):
+        if heartbeat["process_exists"]:
+            return {
+                "state_code": "suspected_stuck",
+                "state_label": "疑似卡住",
+                "detail": f"已超过 {thresholds['heartbeat_missing_seconds']} 秒未收到 heartbeat，最后一次显示进程仍存在",
+                "heartbeat_elapsed": heartbeat_elapsed,
+                "action_text": action_text,
+                "last_progress_change_at": heartbeat["last_progress_change_at"],
+            }
+        return {
+            "state_code": "stopped",
+            "state_label": "已停止",
+            "detail": f"已超过 {thresholds['heartbeat_missing_seconds']} 秒未收到 heartbeat，最后一次显示无进程",
+            "heartbeat_elapsed": heartbeat_elapsed,
+            "action_text": action_text,
+            "last_progress_change_at": heartbeat["last_progress_change_at"],
+        }
+
+    if intent == "skip_today":
+        return {
+            "state_code": "waiting_schedule",
+            "state_label": "等待定时",
+            "detail": "今天已被标记为跳过，等待下一次计划启动",
+            "heartbeat_elapsed": heartbeat_elapsed,
+            "action_text": action_text,
+            "last_progress_change_at": heartbeat["last_progress_change_at"],
+        }
+
+    intent_elapsed: Optional[int] = None
+    if intent_dt is not None:
+        intent_elapsed = int(max(0, (now_dt - intent_dt).total_seconds()))
+
+    if intent in {"start_requested", "restart_requested"}:
+        if intent_elapsed is not None and intent_elapsed <= thresholds["startup_grace_seconds"]:
+            return {
+                "state_code": "starting",
+                "state_label": "启动中",
+                "detail": f"处于 {thresholds['startup_grace_seconds']} 秒启动保护期内",
+                "heartbeat_elapsed": heartbeat_elapsed,
+                "action_text": action_text,
+                "last_progress_change_at": heartbeat["last_progress_change_at"],
+            }
+        if not heartbeat["process_exists"]:
+            return {
+                "state_code": "startup_failed",
+                "state_label": "启动失败",
+                "detail": f"超过 {thresholds['startup_grace_seconds']} 秒仍未检测到 qiannian 进程",
+                "heartbeat_elapsed": heartbeat_elapsed,
+                "action_text": action_text,
+                "last_progress_change_at": heartbeat["last_progress_change_at"],
+            }
+
+    if not heartbeat["process_exists"]:
+        if schedule_due_today and intent != "stop_requested":
+            return {
+                "state_code": "waiting_schedule",
+                "state_label": "等待定时",
+                "detail": f"今天计划在 {schedule_text} 启动，当前仍在等待",
+                "heartbeat_elapsed": heartbeat_elapsed,
+                "action_text": action_text,
+                "last_progress_change_at": heartbeat["last_progress_change_at"],
+            }
+        return {
+            "state_code": "stopped",
+            "state_label": "已停止",
+            "detail": "当前未检测到 qiannian 进程",
+            "heartbeat_elapsed": heartbeat_elapsed,
+            "action_text": action_text,
+            "last_progress_change_at": heartbeat["last_progress_change_at"],
+        }
+
+    if last_progress_dt is None:
+        if intent in {"start_requested", "restart_requested"} and intent_elapsed is not None:
+            remaining = max(0, thresholds["startup_grace_seconds"] - intent_elapsed)
+            return {
+                "state_code": "starting",
+                "state_label": "启动中",
+                "detail": f"进程已存在，但还没看到 status.ini 推进证据，剩余保护期约 {remaining} 秒",
+                "heartbeat_elapsed": heartbeat_elapsed,
+                "action_text": action_text,
+                "last_progress_change_at": heartbeat["last_progress_change_at"],
+            }
+        return {
+            "state_code": "suspected_stuck",
+            "state_label": "疑似卡住",
+            "detail": "进程存在，但还没有看到任何 status.ini 推进证据",
+            "heartbeat_elapsed": heartbeat_elapsed,
+            "action_text": action_text,
+            "last_progress_change_at": heartbeat["last_progress_change_at"],
+        }
+
+    progress_elapsed = int(max(0, (now_dt - last_progress_dt).total_seconds()))
+    if progress_elapsed <= thresholds["progress_stall_seconds"]:
+        return {
+            "state_code": "running",
+            "state_label": "运行中",
+            "detail": f"最近 {progress_elapsed} 秒内看到过 status.ini 推进",
+            "heartbeat_elapsed": heartbeat_elapsed,
+            "action_text": action_text,
+            "last_progress_change_at": heartbeat["last_progress_change_at"],
+        }
+    return {
+        "state_code": "suspected_stuck",
+        "state_label": "疑似卡住",
+        "detail": f"进程存在，但已超过 {thresholds['progress_stall_seconds']} 秒未看到 status.ini 推进",
+        "heartbeat_elapsed": heartbeat_elapsed,
+        "action_text": action_text,
+        "last_progress_change_at": heartbeat["last_progress_change_at"],
+    }
+
+
+def build_dashboard_summary(rows: List[Dict[str, Any]]) -> Dict[str, int]:
+    return {
+        "agent_count": len(rows),
+        "supervision_issue_count": sum(
+            1 for row in rows if row.get("supervision_code") in SUPERVISION_ISSUE_CODES
+        ),
+        "waiting_count": sum(
+            1 for row in rows if row.get("supervision_code") == "waiting_schedule"
+        ),
+        "running_count": sum(
+            1 for row in rows if row.get("supervision_code") == "running"
+        ),
+        "result_stale_count": sum(
+            1 for row in rows if row.get("result_code") == "stale"
+        ),
+        "completed_count": sum(
+            1 for row in rows if row.get("result_code") == "completed"
+        ),
+    }
+
 
 
 def blank_agent_profile() -> Dict[str, Any]:
@@ -1413,35 +1870,75 @@ def build_rows() -> List[Dict[str, Any]]:
     ensure_runtime_state_for_today()
     now_ts = time.time()
     with state_lock:
-        values = list(agent_states.values())
+        report_values = {key: dict(value) for key, value in agent_states.items()}
+        heartbeat_values = {key: dict(value) for key, value in heartbeat_states.items()}
     profiles = {profile["agent_id"]: profile for profile in list_agent_profiles()}
 
     rows: List[Dict[str, Any]] = []
-    for item in values:
-        elapsed = int(max(0, now_ts - item["server_epoch"]))
-        agent_profile = profiles.get(str(item.get("agent_id", "")))
-        completion_state = get_completion_state(agent_profile, item)
-        stale = False if completion_state["completed"] else elapsed > settings.alert_timeout_seconds
-        region = item["region"]
+    active_agent_ids = set(report_values.keys()) | set(heartbeat_values.keys())
+    for agent_id in active_agent_ids:
+        report_item = report_values.get(agent_id)
+        heartbeat_item = heartbeat_values.get(agent_id)
+        agent_profile = profiles.get(str(agent_id), {})
+
+        alert_snapshot = build_agent_runtime_snapshot(agent_id)
+        result_snapshot = build_result_snapshot(agent_profile, report_item, now_ts=now_ts)
+        supervision_snapshot = build_supervision_snapshot(
+            agent_profile,
+            heartbeat_item,
+            now_ts=now_ts,
+        )
+        heartbeat_snapshot = build_heartbeat_snapshot(heartbeat_item, now_ts=now_ts)
+
+        region = str(
+            (report_item or {}).get("region")
+            or agent_profile.get("region")
+            or ""
+        ).strip()
         region_number = extract_region_number(region)
+        progress_group = heartbeat_snapshot["status_group"] or result_snapshot["current_group"]
+        progress_role_index = (
+            heartbeat_snapshot["status_role_index"] or result_snapshot["role_index"]
+        )
         rows.append(
             {
-                "event": item["event"],
-                "agent_id": item["agent_id"],
+                "event": str((report_item or {}).get("event", "") or "-"),
+                "agent_id": agent_id,
                 "region": region,
                 "region_number": region_number,
-                "current_group": item["current_group"],
-                "finished_group": item["finished_group"],
-                "next_group": item["next_group"],
-                "role_index": item["role_index"],
-                "client_ts": item["client_ts"],
-                "server_time": item["server_time"],
-                "elapsed": elapsed,
-                "stale": stale,
-                "completed": completion_state["completed"],
-                "target_group_end": completion_state["target_group_end"],
-                "complete_role_index": completion_state["complete_role_index"],
-                "completion_basis": completion_state["completion_basis"],
+                "current_group": result_snapshot["current_group"],
+                "finished_group": result_snapshot["finished_group"],
+                "next_group": result_snapshot["next_group"],
+                "role_index": result_snapshot["role_index"],
+                "client_ts": (report_item or {}).get("client_ts", ""),
+                "server_time": (report_item or {}).get("server_time", ""),
+                "elapsed": alert_snapshot["elapsed"],
+                "stale": alert_snapshot["stale"],
+                "completed": alert_snapshot["completed"],
+                "target_group_end": alert_snapshot["target_group_end"],
+                "complete_role_index": alert_snapshot["complete_role_index"],
+                "completion_basis": alert_snapshot["completion_basis"],
+                "supervision_state": supervision_snapshot["state_label"],
+                "supervision_code": supervision_snapshot["state_code"],
+                "supervision_detail": supervision_snapshot["detail"],
+                "supervision_heartbeat_elapsed": supervision_snapshot["heartbeat_elapsed"],
+                "action_text": supervision_snapshot["action_text"],
+                "result_state": result_snapshot["state_label"],
+                "result_code": result_snapshot["state_code"],
+                "result_detail": result_snapshot["detail"],
+                "result_elapsed": result_snapshot["elapsed"],
+                "result_server_time": result_snapshot["server_time"],
+                "progress_group": progress_group,
+                "progress_role_index": progress_role_index,
+                "status_date": heartbeat_snapshot["status_date"],
+                "status_exists": heartbeat_snapshot["status_exists"],
+                "process_exists": heartbeat_snapshot["process_exists"],
+                "process_pid": heartbeat_snapshot["process_pid"],
+                "heartbeat_at": heartbeat_snapshot["server_time"],
+                "heartbeat_elapsed": heartbeat_snapshot["heartbeat_elapsed"],
+                "last_progress_change_at": heartbeat_snapshot["last_progress_change_at"],
+                "last_restart_at": heartbeat_snapshot["last_restart_at"],
+                "restart_count_today": heartbeat_snapshot["restart_count_today"],
             }
         )
 
@@ -1454,6 +1951,7 @@ def build_rows() -> List[Dict[str, Any]]:
         )
     )
     return rows
+
 
 def build_region_groups(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     groups: List[Dict[str, Any]] = []
@@ -1471,7 +1969,10 @@ def build_region_groups(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
                 "region": region_label,
                 "region_number": row["region_number"],
                 "count": 0,
-                "stale_count": 0,
+                "supervision_issue_count": 0,
+                "running_count": 0,
+                "waiting_count": 0,
+                "result_stale_count": 0,
                 "completed_count": 0,
                 "rows": [],
             }
@@ -1479,9 +1980,15 @@ def build_region_groups(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 
         group["rows"].append(row)
         group["count"] += 1
-        if row["stale"]:
-            group["stale_count"] += 1
-        if row.get("completed", False):
+        if row.get("supervision_code") in SUPERVISION_ISSUE_CODES:
+            group["supervision_issue_count"] += 1
+        if row.get("supervision_code") == "running":
+            group["running_count"] += 1
+        if row.get("supervision_code") == "waiting_schedule":
+            group["waiting_count"] += 1
+        if row.get("result_code") == "stale":
+            group["result_stale_count"] += 1
+        if row.get("result_code") == "completed":
             group["completed_count"] += 1
 
     return groups
@@ -1743,6 +2250,7 @@ async def index(
 ) -> HTMLResponse:
     rows = build_rows()
     region_groups = build_region_groups(rows)
+    summary = build_dashboard_summary(rows)
     return templates.TemplateResponse(
         "index.html",
         {
@@ -1753,6 +2261,7 @@ async def index(
             "ui_auto_refresh_seconds": settings.ui_auto_refresh_seconds,
             "rows": rows,
             "region_groups": region_groups,
+            "summary": summary,
             "region_stats": get_region_stats(),
             "auth_token": auth_token or "",
             "console_url": append_query_params("/console", auth_token=auth_token),
@@ -2134,6 +2643,10 @@ async def api_agent_control(
     if not agent_profile:
         raise HTTPException(status_code=404, detail="agent profile not found")
 
+    with state_lock:
+        heartbeat_item = dict(heartbeat_states.get(agent_profile["agent_id"], {}))
+        report_item = dict(agent_states.get(agent_profile["agent_id"], {}))
+
     return {
         "ok": True,
         "server_time": now_str(),
@@ -2149,11 +2662,61 @@ async def api_agent_control(
         },
         "control": build_agent_control(agent_profile),
         "runtime": build_agent_runtime_snapshot(agent_profile["agent_id"]),
+        "heartbeat": build_heartbeat_snapshot(heartbeat_item),
+        "supervision": build_supervision_snapshot(agent_profile, heartbeat_item),
+        "result": build_result_snapshot(agent_profile, report_item),
         "updated_at": agent_profile["updated_at"],
     }
 
 
+@app.post("/api/agent/heartbeat")
+async def api_agent_heartbeat(
+    payload: AgentHeartbeatPayload,
+    x_auth_token: Optional[str] = Header(default=None),
+    auth_token: Optional[str] = Query(default=None),
+) -> Dict[str, Any]:
+    ensure_auth(x_auth_token, auth_token)
+    ensure_runtime_state_for_today()
+    server_time = now_str()
+    server_epoch = time.time()
+    heartbeat = {
+        "agent_id": payload.agent_id,
+        "heartbeat_at": payload.heartbeat_at,
+        "intent": str(payload.intent or "none").strip() or "none",
+        "intent_reason": str(payload.intent_reason or "").strip(),
+        "intent_at": payload.intent_at,
+        "process_exists": bool(payload.process_exists),
+        "process_pid": max(0, parse_int(payload.process_pid, 0)),
+        "status_exists": bool(payload.status_exists),
+        "status_group": max(0, parse_int(payload.status_group, 0)),
+        "status_role_index": max(0, parse_int(payload.status_role_index, 0)),
+        "status_date": str(payload.status_date or "").strip(),
+        "status_mtime_epoch": float(payload.status_mtime_epoch or 0),
+        "last_progress_change_at": str(payload.last_progress_change_at or "").strip(),
+        "last_restart_at": str(payload.last_restart_at or "").strip(),
+        "restart_count_today": max(0, parse_int(payload.restart_count_today, 0)),
+        "server_time": server_time,
+        "server_epoch": server_epoch,
+    }
+    with state_lock:
+        heartbeat_states[payload.agent_id] = heartbeat
+        report_item = dict(agent_states.get(payload.agent_id, {}))
+    agent_profile = get_agent_profile(payload.agent_id)
+    return {
+        "ok": True,
+        "server_time": server_time,
+        "heartbeat": build_heartbeat_snapshot(heartbeat, now_ts=server_epoch),
+        "supervision": build_supervision_snapshot(
+            agent_profile,
+            heartbeat,
+            now_ts=server_epoch,
+        ),
+        "result": build_result_snapshot(agent_profile, report_item, now_ts=server_epoch),
+    }
+
+
 @app.get("/api/resources/manifest", name="api_resources_manifest")
+
 async def api_resources_manifest(
     request: Request,
     agent_id: Optional[str] = Query(default=None),
@@ -2323,6 +2886,9 @@ async def api_agent_remove(
         if payload.agent_id in agent_states:
             agent_states.pop(payload.agent_id, None)
             removed = True
+        if payload.agent_id in heartbeat_states:
+            heartbeat_states.pop(payload.agent_id, None)
+            removed = True
         stale_state.pop(payload.agent_id, None)
         completed_state.pop(payload.agent_id, None)
         completed_notice_sent.pop(payload.agent_id, None)
@@ -2344,8 +2910,9 @@ async def api_agents_clear(
     ensure_auth(x_auth_token, auth_token)
 
     with state_lock:
-        agent_count = len(agent_states)
+        agent_count = len(set(agent_states.keys()) | set(heartbeat_states.keys()))
         agent_states.clear()
+        heartbeat_states.clear()
         stale_state.clear()
         completed_state.clear()
         completed_notice_sent.clear()

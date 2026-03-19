@@ -1,38 +1,55 @@
-{% macro render_rows(rows) -%}
+﻿{% macro render_rows(rows) -%}
     {% if rows %}
         {% for r in rows %}
             <tr>
                 <td>
-                    {{ r.agent_id }}
+                    <strong>{{ r.agent_id }}</strong>
                     <div class="small">{{ r.event }}</div>
                 </td>
-                <td>{{ r.region or "-" }}</td>
-                <td>{{ r.current_group }}</td>
-                <td>{{ r.role_index }}</td>
+                <td>{{ r.region or '-' }}</td>
                 <td>
-                    {{ r.server_time }}
-                    {% if r.client_ts %}
-                        <div class="small">client: {{ r.client_ts }}</div>
-                    {% endif %}
+                    <span class="status-chip status-{{ r.supervision_code }}">{{ r.supervision_state }}</span>
+                    <div class="small">{{ r.action_text }}</div>
+                    <div class="small">{{ r.supervision_detail }}</div>
                 </td>
-                <td>{{ r.elapsed }}</td>
                 <td>
-                    {% if r.stale %}
-                        <span class="warn">超时</span>
-                    {% elif r.completed %}
-                        <span class="done">已完成</span>
+                    <span class="status-chip result-{{ r.result_code }}">{{ r.result_state }}</span>
+                    <div class="small">{{ r.result_detail }}</div>
+                </td>
+                <td>
+                    <div>group={{ r.progress_group or '-' }}</div>
+                    <div class="small">role={{ r.progress_role_index or '-' }}{% if r.status_date %} / status={{ r.status_date }}{% endif %}</div>
+                    <div class="small">process={{ 'yes' if r.process_exists else 'no' }}{% if r.process_pid %} / pid={{ r.process_pid }}{% endif %}</div>
+                </td>
+                <td>
+                    {% if r.last_progress_change_at %}
+                        {{ r.last_progress_change_at }}
+                        <div class="small">heartbeat: {{ r.heartbeat_at or '-' }}</div>
                     {% else %}
-                        <span class="ok">正常</span>
+                        -
+                        <div class="small">heartbeat: {{ r.heartbeat_at or '-' }}</div>
                     {% endif %}
                 </td>
                 <td>
-                    <button class="btn" onclick='removeAgent({{ r.agent_id|tojson }})'>删除</button>
+                    {% if r.result_server_time %}
+                        {{ r.result_server_time }}
+                        <div class="small">{{ r.result_elapsed if r.result_elapsed is not none else '-' }} 秒前</div>
+                    {% else %}
+                        -
+                    {% endif %}
+                </td>
+                <td>
+                    {{ r.restart_count_today }}
+                    <div class="small">{{ r.last_restart_at or '-' }}</div>
+                </td>
+                <td>
+                    <button class="btn" onclick='removeAgent({{ r.agent_id|tojson }})'>移除</button>
                 </td>
             </tr>
         {% endfor %}
     {% else %}
         <tr>
-            <td colspan="8" class="empty">暂无上报数据</td>
+            <td colspan="8" class="empty">当前还没有收到任何结果上报或 heartbeat。</td>
         </tr>
     {% endif %}
 {%- endmacro %}
@@ -44,285 +61,198 @@
     <title>{{ app_name }}</title>
     <style>
         :root {
-            --bg: #f4f6fb;
+            --bg: #f3f6fb;
             --card: #ffffff;
-            --line: #dbe2ea;
-            --line-strong: #c7d0db;
-            --text: #17202b;
-            --muted: #607083;
-            --ok: #15803d;
-            --warn: #dc2626;
-            --accent: #165dff;
-            --accent-soft: #eff5ff;
-            --shadow: 0 10px 30px rgba(23, 32, 43, 0.06);
+            --line: #d9e1ea;
+            --line-strong: #c6d0dc;
+            --text: #15202b;
+            --muted: #64748b;
+            --accent: #0f6cbd;
+            --accent-soft: #eaf4ff;
+            --warn: #b42318;
+            --warn-soft: #fff3f2;
+            --ok: #0f766e;
+            --ok-soft: #ecfdf3;
+            --shadow: 0 16px 40px rgba(15, 23, 42, 0.08);
         }
-
-        * {
-            box-sizing: border-box;
-        }
-
+        * { box-sizing: border-box; }
         body {
             margin: 0;
-            background:
-                radial-gradient(circle at top left, rgba(22, 93, 255, 0.08), transparent 24%),
-                linear-gradient(180deg, #f7f9fc 0%, #eef3f9 100%);
             color: var(--text);
-            font-family: "Segoe UI", "PingFang SC", "Microsoft YaHei", Arial, sans-serif;
+            background:
+                radial-gradient(circle at top left, rgba(15, 108, 189, 0.08), transparent 24%),
+                linear-gradient(180deg, #f8fbff 0%, #edf3f8 100%);
+            font-family: "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
         }
-
         .container {
-            max-width: 1280px;
-            margin: 20px auto;
-            padding: 0 14px 24px;
+            max-width: 1480px;
+            margin: 22px auto;
+            padding: 0 14px 26px;
         }
-
         .card {
             background: var(--card);
             border: 1px solid var(--line);
-            border-radius: 16px;
-            padding: 16px;
-            margin-bottom: 16px;
+            border-radius: 18px;
             box-shadow: var(--shadow);
+            margin-bottom: 16px;
         }
-
         .hero {
-            padding: 20px;
+            padding: 22px;
         }
-
         h1 {
-            margin: 0 0 10px 0;
+            margin: 0 0 10px;
             font-size: 34px;
-            line-height: 1.05;
+            line-height: 1.06;
         }
-
         h2 {
             margin: 0;
             font-size: 22px;
         }
-
-        .meta {
+        .meta, .summary, .toolbar, .toolbar-left, .toolbar-right {
             display: flex;
             flex-wrap: wrap;
-            gap: 12px;
-            color: var(--muted);
-            font-size: 14px;
+            gap: 10px;
+            align-items: center;
         }
-
-        .meta span {
-            background: #f8fafc;
+        .meta span, .badge {
             border: 1px solid var(--line);
             border-radius: 999px;
             padding: 6px 12px;
+            background: #fff;
+            color: var(--muted);
+            font-size: 13px;
         }
-
         .toolbar {
-            display: flex;
-            align-items: center;
             justify-content: space-between;
-            gap: 12px;
-            margin-bottom: 12px;
-            flex-wrap: wrap;
+            padding: 18px 18px 0;
         }
-
-        .toolbar-left {
-            display: flex;
-            align-items: center;
-            gap: 10px;
-            flex-wrap: wrap;
+        .toolbar-card {
+            padding-bottom: 18px;
         }
-
-        .toolbar-right {
-            display: flex;
-            align-items: center;
-            gap: 10px;
-            flex-wrap: wrap;
-        }
-
         .hint {
             color: var(--muted);
             font-size: 13px;
         }
-
         .btn {
             border: 1px solid var(--line-strong);
-            background: #ffffff;
+            border-radius: 12px;
+            padding: 9px 14px;
+            background: #fff;
             color: var(--text);
-            border-radius: 10px;
-            padding: 6px 12px;
+            text-decoration: none;
             cursor: pointer;
             font-size: 14px;
         }
-
-        .btn:hover {
-            opacity: 0.88;
-        }
-
+        .btn:hover { opacity: 0.88; }
         .btn-danger {
             border-color: #ef4444;
             color: #b91c1c;
         }
-
-        .summary {
-            display: flex;
-            flex-wrap: wrap;
-            gap: 10px;
-        }
-
-        .badge {
-            border-radius: 999px;
-            padding: 4px 10px;
-            font-size: 12px;
-            font-weight: 600;
-            border: 1px solid var(--line);
-            background: #ffffff;
-            color: var(--muted);
-        }
-
         .badge-accent {
             background: var(--accent-soft);
-            border-color: #d5e3ff;
+            border-color: #cae5ff;
             color: var(--accent);
         }
-
         .badge-warn {
-            background: #fff2f2;
+            background: var(--warn-soft);
             border-color: #fecaca;
             color: var(--warn);
         }
-
-        .badge-done {
-            background: #ecfeff;
-            border-color: #a5f3fc;
-            color: #0f766e;
+        .badge-ok {
+            background: var(--ok-soft);
+            border-color: #b7ebd2;
+            color: var(--ok);
         }
-
         .region-section {
+            margin: 16px 18px 0;
             border: 1px solid var(--line);
-            border-radius: 14px;
+            border-radius: 16px;
             overflow: hidden;
-            margin-top: 14px;
             background: #fbfdff;
         }
-
         .region-head {
             display: flex;
-            align-items: center;
             justify-content: space-between;
             gap: 12px;
+            align-items: center;
             padding: 14px 16px;
-            background: linear-gradient(180deg, #f8fbff 0%, #f1f6ff 100%);
+            background: linear-gradient(180deg, #f9fbff 0%, #f1f6ff 100%);
             border-bottom: 1px solid var(--line);
         }
-
         .region-subtitle {
             margin-top: 4px;
             color: var(--muted);
             font-size: 13px;
         }
-
         table {
             width: 100%;
             border-collapse: collapse;
         }
-
-        th {
+        th, td {
+            border-bottom: 1px solid var(--line);
+            padding: 10px 8px;
             text-align: left;
+            vertical-align: top;
+            background: #fff;
+            font-size: 14px;
+        }
+        th {
+            color: var(--muted);
             font-size: 13px;
             letter-spacing: 0.02em;
-            color: var(--muted);
-            border-bottom: 1px solid var(--line);
-            padding: 10px 8px;
-            background: #ffffff;
         }
-
-        td {
-            font-size: 14px;
-            border-bottom: 1px solid var(--line);
-            padding: 10px 8px;
-            vertical-align: top;
-            background: #ffffff;
-        }
-
-        tr:last-child td {
-            border-bottom: none;
-        }
-
+        tr:last-child td { border-bottom: none; }
         .small {
             color: var(--muted);
             font-size: 12px;
+            line-height: 1.45;
+            margin-top: 3px;
         }
-
-        .ok {
-            color: var(--ok);
-            font-weight: 600;
-        }
-
-        .warn {
-            color: var(--warn);
-            font-weight: 600;
-        }
-
-        .done {
-            color: #0f766e;
-            font-weight: 600;
-        }
-
         .empty {
-            color: var(--muted);
-            font-size: 13px;
+            padding: 26px 10px;
             text-align: center;
-            padding: 24px 10px;
+            color: var(--muted);
         }
-
-        .region-card-title {
-            margin: 0 0 10px 0;
-            font-size: 20px;
-        }
-
-        .chip {
-            display: inline-block;
-            border: 1px solid var(--line);
+        .status-chip {
+            display: inline-flex;
+            align-items: center;
             border-radius: 999px;
             padding: 4px 10px;
-            margin: 4px 6px 0 0;
             font-size: 12px;
-            color: var(--muted);
-            background: #ffffff;
+            font-weight: 700;
+            border: 1px solid var(--line);
+            background: #fff;
         }
-
+        .status-running, .result-fresh, .result-completed {
+            color: var(--ok);
+            background: var(--ok-soft);
+            border-color: #b7ebd2;
+        }
+        .status-waiting_schedule, .status-starting {
+            color: var(--accent);
+            background: var(--accent-soft);
+            border-color: #cae5ff;
+        }
+        .status-suspected_stuck, .status-startup_failed, .result-stale {
+            color: var(--warn);
+            background: var(--warn-soft);
+            border-color: #fecaca;
+        }
+        .status-stopped, .result-not_reported {
+            color: var(--muted);
+            background: #f8fafc;
+            border-color: var(--line);
+        }
         .footer {
-            margin-top: 10px;
             color: var(--muted);
             font-size: 12px;
+            padding: 16px 18px 0;
         }
-
-        @media (max-width: 900px) {
-            .container {
-                margin-top: 14px;
-                padding: 0 10px 18px;
-            }
-
-            h1 {
-                font-size: 26px;
-            }
-
-            h2 {
-                font-size: 18px;
-            }
-
-            .meta,
-            .summary,
-            .toolbar,
-            .toolbar-left,
-            .region-head {
-                gap: 8px;
-            }
-
-            th,
-            td {
-                font-size: 13px;
-                padding: 8px 6px;
-            }
+        @media (max-width: 960px) {
+            .container { margin-top: 14px; padding: 0 10px 18px; }
+            h1 { font-size: 28px; }
+            h2 { font-size: 18px; }
+            th, td { font-size: 13px; padding: 8px 6px; }
         }
     </style>
 </head>
@@ -331,29 +261,33 @@
     <div class="card hero">
         <h1>{{ app_name }}</h1>
         <div class="meta">
-            <span>超时阈值：{{ timeout }} 秒</span>
-            <span>自动刷新：{{ ui_auto_refresh_seconds }} 秒</span>
+            <span>结果超时阈值：{{ timeout }} 秒</span>
+            <span>页面自动刷新：{{ ui_auto_refresh_seconds }} 秒</span>
             <span>布局模式：{% if ui_layout_mode == "grouped" %}按区服分组{% else %}普通列表{% endif %}</span>
             <span>时间：<span id="now">-</span></span>
-            <span>配置台 VM：{{ agent_profile_count }}</span>
+            <span>已配置 VM：{{ agent_profile_count }}</span>
             <span>资源条目：{{ resource_item_count }}</span>
         </div>
     </div>
 
-    <div class="card">
+    <div class="card toolbar-card">
         <div class="toolbar">
             <div class="toolbar-left">
                 <button class="btn btn-danger" onclick="clearAllAgents()">清空当前页面 Agent</button>
-                <span class="hint">页面展示由 .env 中的 UI_LAYOUT_MODE 和 UI_AUTO_REFRESH_SECONDS 控制</span>
+                <span class="hint">页面只负责展示监督状态和结果状态，不改原来的告警策略。</span>
             </div>
             <div class="toolbar-right">
                 <a class="btn" href="{{ console_url }}">打开配置台</a>
             </div>
+        </div>
+        <div class="toolbar" style="padding-top: 14px; justify-content: flex-start;">
             <div class="summary">
-                <span class="badge badge-accent">当前 Agent：{{ rows | length }}</span>
-                {% if ui_layout_mode == "grouped" %}
-                    <span class="badge">区服分组：{{ region_groups | length }}</span>
-                {% endif %}
+                <span class="badge badge-accent">当前 Agent：{{ summary.agent_count }}</span>
+                <span class="badge badge-ok">运行中：{{ summary.running_count }}</span>
+                <span class="badge">等待定时：{{ summary.waiting_count }}</span>
+                <span class="badge badge-warn">监督异常：{{ summary.supervision_issue_count }}</span>
+                <span class="badge badge-warn">结果超时：{{ summary.result_stale_count }}</span>
+                <span class="badge badge-ok">已完成：{{ summary.completed_count }}</span>
             </div>
         </div>
 
@@ -364,18 +298,20 @@
                         <div class="region-head">
                             <div>
                                 <h2>{{ group.region }}</h2>
-                                <div class="region-subtitle">按区服聚合显示，便于连续查看和排查</div>
+                                <div class="region-subtitle">监督状态看“活着没、推进没”，结果状态看“组完成结果有没有更新”。</div>
                             </div>
                             <div class="summary">
                                 <span class="badge badge-accent">Agent {{ group.count }}</span>
-                                {% if group.stale_count %}
-                                    <span class="badge badge-warn">超时 {{ group.stale_count }}</span>
+                                <span class="badge badge-ok">运行中 {{ group.running_count }}</span>
+                                <span class="badge">等待 {{ group.waiting_count }}</span>
+                                {% if group.supervision_issue_count %}
+                                    <span class="badge badge-warn">监督异常 {{ group.supervision_issue_count }}</span>
+                                {% endif %}
+                                {% if group.result_stale_count %}
+                                    <span class="badge badge-warn">结果超时 {{ group.result_stale_count }}</span>
                                 {% endif %}
                                 {% if group.completed_count %}
-                                    <span class="badge badge-done">已完成 {{ group.completed_count }}</span>
-                                {% endif %}
-                                {% if (not group.stale_count) and (not group.completed_count) %}
-                                    <span class="badge">全部正常</span>
+                                    <span class="badge badge-ok">已完成 {{ group.completed_count }}</span>
                                 {% endif %}
                             </div>
                         </div>
@@ -384,11 +320,12 @@
                             <tr>
                                 <th>Agent</th>
                                 <th>区服</th>
-                                <th>当前执行组</th>
-                                <th>当前上报角色</th>
-                                <th>最后上报时间</th>
-                                <th>距今秒数</th>
-                                <th>状态</th>
+                                <th>监督状态</th>
+                                <th>结果状态</th>
+                                <th>当前进度</th>
+                                <th>最近推进</th>
+                                <th>最后结果上报</th>
+                                <th>重启</th>
                                 <th>操作</th>
                             </tr>
                             </thead>
@@ -400,49 +337,48 @@
                 {% endfor %}
             {% else %}
                 <table>
-                    <tbody>
-                    {{ render_rows([]) }}
-                    </tbody>
+                    <tbody>{{ render_rows([]) }}</tbody>
                 </table>
             {% endif %}
         {% else %}
-            <table>
-                <thead>
-                <tr>
-                    <th>Agent</th>
-                    <th>区服</th>
-                    <th>当前执行组</th>
-                    <th>当前上报角色</th>
-                    <th>最后上报时间</th>
-                    <th>距今秒数</th>
-                    <th>状态</th>
-                    <th>操作</th>
-                </tr>
-                </thead>
-                <tbody>
-                {{ render_rows(rows) }}
-                </tbody>
-            </table>
+            <div style="padding: 18px;">
+                <table>
+                    <thead>
+                    <tr>
+                        <th>Agent</th>
+                        <th>区服</th>
+                        <th>监督状态</th>
+                        <th>结果状态</th>
+                        <th>当前进度</th>
+                        <th>最近推进</th>
+                        <th>最后结果上报</th>
+                        <th>重启</th>
+                        <th>操作</th>
+                    </tr>
+                    </thead>
+                    <tbody>{{ render_rows(rows) }}</tbody>
+                </table>
+            </div>
         {% endif %}
 
-        <div class="footer">企业微信机器人支持 ALERT_WEBHOOK_URL 和 ALERT_WEBHOOK_URLS 两种配置方式。</div>
+        <div class="footer">当前版本的 heartbeat 只上报外部证据：进程、status.ini、最近推进时间。页面上的“结果状态”仍然只参考 qiannian 的结果上报。</div>
     </div>
 
     {% if region_stats and region_stats.enabled %}
-    <div class="card">
-        <h2 class="region-card-title">区服完成统计</h2>
-        <div class="meta">
+    <div class="card hero">
+        <h2>区服完成统计</h2>
+        <div class="meta" style="margin-top: 10px;">
             <span>总区服数：{{ region_stats.max_regions }}</span>
             <span>已完成：{{ region_stats.completed_count }}</span>
             <span>未完成：{{ region_stats.missing_regions | length }}</span>
         </div>
-        <div style="margin-top: 10px;">
+        <div style="margin-top: 12px;">
             {% if region_stats.missing_regions %}
                 {% for region in region_stats.missing_regions %}
-                    <span class="chip">{{ region }}</span>
+                    <span class="badge">{{ region }}</span>
                 {% endfor %}
             {% else %}
-                <span class="ok">全部区服已完成</span>
+                <span class="badge badge-ok">全部区服已完成</span>
             {% endif %}
         </div>
     </div>
@@ -461,24 +397,24 @@
 
     async function removeAgent(agentId) {
         if (!agentId) return;
-        if (!confirm(`确认删除 ${agentId} 吗？`)) return;
+        if (!confirm(`确认移除 ${agentId} 吗？`)) return;
         const resp = await fetch(buildApiUrl('/api/agent/remove'), {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ agent_id: agentId })
         });
         if (!resp.ok) {
-            alert('删除失败，请检查鉴权或服务日志');
+            alert('移除失败，请检查鉴权或服务日志。');
             return;
         }
         location.reload();
     }
 
     async function clearAllAgents() {
-        if (!confirm('确认清空当前页面所有 Agent 吗？')) return;
+        if (!confirm('确认清空当前页面上的 Agent 吗？')) return;
         const resp = await fetch(buildApiUrl('/api/agents/clear'), { method: 'POST' });
         if (!resp.ok) {
-            alert('清空失败，请检查鉴权或服务日志');
+            alert('清空失败，请检查鉴权或服务日志。');
             return;
         }
         location.reload();
