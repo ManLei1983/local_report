@@ -849,12 +849,15 @@ def build_agent_runtime_snapshot(agent_id: str) -> Dict[str, Any]:
     now_ts = time.time()
     with state_lock:
         item = dict(agent_states.get(agent_id, {}))
+        heartbeat_item = dict(heartbeat_states.get(agent_id, {}))
 
     if not item:
         return {
             "has_report": False,
             "report_timeout_seconds": settings.alert_timeout_seconds,
             "stale": False,
+            "result_stale": False,
+            "stale_suppressed": False,
             "elapsed": None,
             "server_time": "",
             "server_epoch": 0,
@@ -872,10 +875,22 @@ def build_agent_runtime_snapshot(agent_id: str) -> Dict[str, Any]:
     agent_profile = get_agent_profile(agent_id)
     completion_state = get_completion_state(agent_profile, item)
     elapsed = int(max(0, now_ts - float(item.get("server_epoch", 0))))
+    result_stale = False if completion_state["completed"] else elapsed > settings.alert_timeout_seconds
+    supervision_snapshot = build_supervision_snapshot(
+        agent_profile,
+        heartbeat_item or None,
+        now_ts=now_ts,
+    )
+    actionable_stale = should_alert_for_result_stale(
+        result_stale,
+        supervision_snapshot.get("state_code", ""),
+    )
     return {
         "has_report": True,
         "report_timeout_seconds": settings.alert_timeout_seconds,
-        "stale": False if completion_state["completed"] else elapsed > settings.alert_timeout_seconds,
+        "stale": actionable_stale,
+        "result_stale": result_stale,
+        "stale_suppressed": bool(result_stale and not actionable_stale),
         "elapsed": elapsed,
         "server_time": item.get("server_time", ""),
         "server_epoch": item.get("server_epoch", 0),
@@ -892,6 +907,7 @@ def build_agent_runtime_snapshot(agent_id: str) -> Dict[str, Any]:
 
 
 SUPERVISION_ISSUE_CODES = {"suspected_stuck", "startup_failed"}
+SUPERVISION_STALE_SUPPRESS_CODES = {"running", "starting", "waiting_schedule"}
 RESULT_ACTIVE_CODES = {"fresh", "stale", "completed"}
 DEFAULT_HEARTBEAT_MISSING_SECONDS = 90
 DEFAULT_PROGRESS_STALL_SECONDS = 900
@@ -2122,6 +2138,15 @@ def get_alert_cooldown_seconds(agent_id: str, now_ts: float) -> int:
     return settings.alert_cooldown_seconds
 
 
+def should_alert_for_result_stale(
+    result_stale: bool,
+    supervision_code: str,
+) -> bool:
+    if not result_stale:
+        return False
+    return str(supervision_code or "") not in SUPERVISION_STALE_SUPPRESS_CODES
+
+
 async def check_alerts_once() -> None:
     ensure_runtime_state_for_today()
     if not settings.alert_enabled:
@@ -2129,14 +2154,12 @@ async def check_alerts_once() -> None:
 
     now_ts = time.time()
     rows = build_rows()
-    stale_snapshot: Dict[str, bool] = {}
-
     for row in rows:
         agent_id = row["agent_id"]
         elapsed = row["elapsed"]
-        is_stale = row["stale"]
+        result_stale = bool(row.get("result_code") == "stale")
+        alert_stale = bool(row.get("stale", False))
         is_completed = bool(row.get("completed", False))
-        stale_snapshot[agent_id] = is_stale
         prev_stale = stale_state.get(agent_id, False)
         prev_completed = completed_state.get(agent_id, False)
 
@@ -2156,7 +2179,7 @@ async def check_alerts_once() -> None:
         if prev_completed:
             completed_state[agent_id] = False
 
-        if is_stale:
+        if alert_stale:
             if not prev_stale:
                 alert_stale_started_at[agent_id] = now_ts
                 alert_sent_count[agent_id] = 0
@@ -2177,15 +2200,19 @@ async def check_alerts_once() -> None:
                         alert_sent_count[agent_id],
                     )
             stale_state[agent_id] = True
-        else:
-            if prev_stale:
-                ok = await post_wecom_markdown(build_recover_markdown(row, elapsed))
-                if ok:
-                    logger.info("recover alert sent: agent=%s", agent_id)
-            stale_state[agent_id] = False
-            alert_stale_started_at.pop(agent_id, None)
-            alert_sent_count.pop(agent_id, None)
-            last_alert_sent_at.pop(agent_id, None)
+            continue
+
+        if result_stale:
+            continue
+
+        if prev_stale:
+            ok = await post_wecom_markdown(build_recover_markdown(row, elapsed))
+            if ok:
+                logger.info("recover alert sent: agent=%s", agent_id)
+        stale_state[agent_id] = False
+        alert_stale_started_at.pop(agent_id, None)
+        alert_sent_count.pop(agent_id, None)
+        last_alert_sent_at.pop(agent_id, None)
 
     with state_lock:
         active_ids = set(agent_states.keys())
