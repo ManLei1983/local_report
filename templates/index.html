@@ -226,7 +226,7 @@
             border: 1px solid var(--line);
             background: #fff;
         }
-        .status-running, .result-fresh, .result-completed {
+        .status-running, .status-result_active, .result-fresh, .result-completed {
             color: var(--ok);
             background: var(--ok-soft);
             border-color: #b7ebd2;
@@ -286,7 +286,7 @@
         <div class="toolbar" style="padding-top: 14px; justify-content: flex-start;">
             <div class="summary">
                 <span class="badge badge-accent">当前 Agent：{{ summary.agent_count }}</span>
-                <span class="badge badge-ok">运行中：{{ summary.running_count }}</span>
+                <span class="badge badge-ok">活跃中：{{ summary.active_count }}</span>
                 <span class="badge">等待定时：{{ summary.waiting_count }}</span>
                 <span class="badge badge-warn">监督异常：{{ summary.supervision_issue_count }}</span>
                 <span class="badge badge-warn">结果超时：{{ summary.result_stale_count }}</span>
@@ -305,7 +305,7 @@
                             </div>
                             <div class="summary">
                                 <span class="badge badge-accent">Agent {{ group.count }}</span>
-                                <span class="badge badge-ok">运行中 {{ group.running_count }}</span>
+                                <span class="badge badge-ok">活跃中 {{ group.active_count }}</span>
                                 <span class="badge">等待 {{ group.waiting_count }}</span>
                                 {% if group.supervision_issue_count %}
                                     <span class="badge badge-warn">监督异常 {{ group.supervision_issue_count }}</span>
@@ -364,7 +364,7 @@
             </div>
         {% endif %}
 
-        <div class="footer">当前版本的 heartbeat 只上报外部证据：进程、status.ini、最近推进时间。页面上的“结果状态”仍然只参考 qiannian 的结果上报。</div>
+        <div class="footer">当前版本的 heartbeat 只上报外部证据：进程、status.ini、最近推进时间。如果 game_tool 心跳断开但结果仍在持续刷新，监督状态会显示“结果活跃”。</div>
     </div>
 
     {% if region_stats and region_stats.enabled %}

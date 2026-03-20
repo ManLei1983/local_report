@@ -34,6 +34,7 @@ input[type="text"],input[type="number"],input[type="time"],select,textarea{displ
 input[type="checkbox"]{width:16px;height:16px;min-width:16px;flex:0 0 16px;margin:0;padding:0}
 textarea{min-height:110px;resize:vertical;font-family:Consolas,"Courier New",monospace}
 .hide{display:none}
+.panel-hidden{display:none}
 table{width:100%;border-collapse:collapse}
 th,td{padding:10px 8px;border-bottom:1px solid #d9e2ec;text-align:left;vertical-align:top}
 th{font-size:13px;color:#5a6b7f;background:#f8fbff}
@@ -64,10 +65,11 @@ tr.active td{background:#f5f9ff}
     <span class="pill">Agent：{{ agent_profile_count }}</span>
     <span class="pill">资源：{{ resource_item_count }}</span>
     <span class="pill">临时协助：{{ active_assist_count }}</span>
-    <span class="pill">当前编辑：{{ selected_agent.agent_id or '新建 Agent' }}</span>
+    <span class="pill">当前编辑：{{ selected_agent.agent_id or "新建 Agent" }}</span>
+    <button class="btn" type="button" id="assist-toggle-btn" onclick="toggleAssistPanel()">临时协助任务</button>
   </div>
 
-  <div class="card">
+  <div class="card panel-hidden" id="assist-panel">
     <div class="top" style="margin-bottom:12px">
       <div>
         <h2 class="section-title">临时协助任务</h2>
@@ -300,5 +302,36 @@ tr.active td{background:#f5f9ff}
     </div>
   </div>
 </div>
+<script>
+const ASSIST_PANEL_KEY = "local_report_console_assist_panel";
+function setAssistPanelOpen(open) {
+  const panel = document.getElementById("assist-panel");
+  const button = document.getElementById("assist-toggle-btn");
+  if (!panel || !button) return;
+  panel.classList.toggle("panel-hidden", !open);
+  button.textContent = open ? "收起临时协助任务" : "显示临时协助任务";
+  try { localStorage.setItem(ASSIST_PANEL_KEY, open ? "1" : "0"); } catch (err) {}
+}
+function toggleAssistPanel() {
+  const panel = document.getElementById("assist-panel");
+  if (!panel) return;
+  setAssistPanelOpen(panel.classList.contains("panel-hidden"));
+}
+document.addEventListener("DOMContentLoaded", function () {
+  let open = false;
+  try {
+    const saved = localStorage.getItem(ASSIST_PANEL_KEY);
+    if (saved === "1" || saved === "0") {
+      open = saved === "1";
+    } else {
+      open = {{ "true" if selected_assist else "false" }};
+    }
+  } catch (err) {
+    open = {{ "true" if selected_assist else "false" }};
+  }
+  setAssistPanelOpen(open);
+});
+</script>
+</script>
 </body>
 </html>

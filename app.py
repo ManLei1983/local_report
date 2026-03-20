@@ -1,4 +1,4 @@
-﻿import asyncio
+import asyncio
 import datetime as dt
 import json
 import logging
@@ -958,6 +958,7 @@ def build_agent_runtime_snapshot(agent_id: str) -> Dict[str, Any]:
 
 SUPERVISION_ISSUE_CODES = {"suspected_stuck", "startup_failed"}
 SUPERVISION_STALE_SUPPRESS_CODES = {"running", "starting", "waiting_schedule"}
+ACTIVE_SUPERVISION_CODES = {"running", "starting", "result_active"}
 RESULT_ACTIVE_CODES = {"fresh", "stale", "completed"}
 DEFAULT_HEARTBEAT_MISSING_SECONDS = 90
 DEFAULT_PROGRESS_STALL_SECONDS = 900
@@ -1372,6 +1373,46 @@ def build_supervision_snapshot(
     }
 
 
+def reconcile_supervision_snapshot(
+    agent_profile: Optional[Dict[str, Any]],
+    supervision_snapshot: Dict[str, Any],
+    result_snapshot: Dict[str, Any],
+    heartbeat_snapshot: Dict[str, Any],
+) -> Dict[str, Any]:
+    state_code = str(supervision_snapshot.get("state_code", "") or "")
+    if state_code in ACTIVE_SUPERVISION_CODES:
+        return supervision_snapshot
+
+    result_code = str(result_snapshot.get("state_code", "") or "")
+    result_elapsed = result_snapshot.get("elapsed")
+    if result_code != "fresh" or result_elapsed is None:
+        return supervision_snapshot
+
+    thresholds = get_supervision_thresholds(agent_profile)
+    active_window_seconds = max(30, thresholds["heartbeat_missing_seconds"])
+    if int(max(0, result_elapsed)) > active_window_seconds:
+        return supervision_snapshot
+
+    heartbeat_elapsed = heartbeat_snapshot.get("heartbeat_elapsed")
+    if heartbeat_snapshot.get("has_heartbeat") and heartbeat_elapsed is not None:
+        detail = (
+            f"最近 {result_elapsed} 秒收到有效结果，但 heartbeat 已 {heartbeat_elapsed} 秒未更新；"
+            "当前按结果上报判断仍在推进"
+        )
+    else:
+        detail = (
+            f"最近 {result_elapsed} 秒收到有效结果，但尚未收到新的 game_tool 心跳；"
+            "当前按结果上报判断仍在推进"
+        )
+
+    return {
+        **supervision_snapshot,
+        "state_code": "result_active",
+        "state_label": "结果活跃",
+        "detail": detail,
+    }
+
+
 def build_dashboard_summary(rows: List[Dict[str, Any]]) -> Dict[str, int]:
     return {
         "agent_count": len(rows),
@@ -1381,8 +1422,8 @@ def build_dashboard_summary(rows: List[Dict[str, Any]]) -> Dict[str, int]:
         "waiting_count": sum(
             1 for row in rows if row.get("supervision_code") == "waiting_schedule"
         ),
-        "running_count": sum(
-            1 for row in rows if row.get("supervision_code") == "running"
+        "active_count": sum(
+            1 for row in rows if row.get("supervision_code") in ACTIVE_SUPERVISION_CODES
         ),
         "result_stale_count": sum(
             1 for row in rows if row.get("result_code") == "stale"
@@ -2089,6 +2130,8 @@ def build_agent_task_context(
         return context
     helper_assist = get_active_assist_for_helper(agent_id, work_date=work_date)
     if helper_assist:
+        # Standby helpers should run immediately when an assist task is active.
+        context["enabled"] = True
         context["region"] = str(helper_assist.get("region", "") or context["region"])
         context["group_start"] = max(
             0, parse_int(helper_assist.get("delegate_start"), context["group_start"])
@@ -2363,6 +2406,12 @@ def build_rows() -> List[Dict[str, Any]]:
             now_ts=now_ts,
         )
         heartbeat_snapshot = build_heartbeat_snapshot(heartbeat_item, now_ts=now_ts)
+        supervision_snapshot = reconcile_supervision_snapshot(
+            agent_profile,
+            supervision_snapshot,
+            result_snapshot,
+            heartbeat_snapshot,
+        )
 
         region = str(
             (report_item or {}).get("region")
@@ -2448,7 +2497,7 @@ def build_region_groups(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
                 "region_number": row["region_number"],
                 "count": 0,
                 "supervision_issue_count": 0,
-                "running_count": 0,
+                "active_count": 0,
                 "waiting_count": 0,
                 "result_stale_count": 0,
                 "completed_count": 0,
@@ -2460,8 +2509,8 @@ def build_region_groups(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         group["count"] += 1
         if row.get("supervision_code") in SUPERVISION_ISSUE_CODES:
             group["supervision_issue_count"] += 1
-        if row.get("supervision_code") == "running":
-            group["running_count"] += 1
+        if row.get("supervision_code") in ACTIVE_SUPERVISION_CODES:
+            group["active_count"] += 1
         if row.get("supervision_code") == "waiting_schedule":
             group["waiting_count"] += 1
         if row.get("result_code") == "stale":
