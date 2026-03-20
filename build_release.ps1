@@ -59,11 +59,16 @@ exit /b 0
 @"
 @echo off
 setlocal
+cd /d "%~dp0"
 
-tasklist /FI "IMAGENAME eq local_report_server.exe" 2>NUL | find /I "local_report_server.exe" >NUL
-if errorlevel 1 exit /b 0
+set "TARGET_EXE=%~dp0local_report_server.exe"
+if not exist "%TARGET_EXE%" exit /b 0
 
-taskkill /F /IM local_report_server.exe >NUL 2>&1
+powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "$target = [System.IO.Path]::GetFullPath('%TARGET_EXE%'); $items = @(Get-CimInstance Win32_Process -Filter 'name = ''local_report_server.exe''' -ErrorAction SilentlyContinue | Where-Object { $_.ExecutablePath -and [string]::Equals($_.ExecutablePath, $target, [System.StringComparison]::OrdinalIgnoreCase) }); if (-not $items) { exit 0 }; $items | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction Stop }; Start-Sleep -Milliseconds 800; $left = @(Get-CimInstance Win32_Process -Filter 'name = ''local_report_server.exe''' -ErrorAction SilentlyContinue | Where-Object { $_.ExecutablePath -and [string]::Equals($_.ExecutablePath, $target, [System.StringComparison]::OrdinalIgnoreCase) }); if ($left.Count -gt 0) { exit 1 }"
+if errorlevel 1 (
+    echo [ERROR] stop local_report_server failed
+    exit /b 1
+)
 exit /b 0
 "@ | Set-Content -Path (Join-Path $releaseDir "stop_local_report.bat") -Encoding ASCII
 
