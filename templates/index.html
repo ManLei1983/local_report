@@ -22,6 +22,10 @@
                 <td>
                     <div>group={{ r.progress_group or '-' }}</div>
                     <div class="small">role={{ r.progress_role_index or '-' }}{% if r.status_date %} / status={{ r.status_date }}{% endif %}</div>
+                    <div class="small">source={{ r.progress_source_label or '-' }}</div>
+                    {% if r.progress_note %}
+                        <div class="small">{{ r.progress_note }}</div>
+                    {% endif %}
                     <div class="small">process={{ 'yes' if r.process_exists else 'no' }}{% if r.process_pid %} / pid={{ r.process_pid }}{% endif %}</div>
                 </td>
                 <td>

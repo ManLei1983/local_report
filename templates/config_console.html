@@ -76,6 +76,43 @@ tr.active td{background:#f5f9ff}
         <div class="hint">用于临时让空闲 VM 接手另一台 VM 的尾段任务。保存后不会改动原始 Agent 配置，只会改变当天的有效任务范围。</div>
       </div>
     </div>
+    {% if assist_target_plans %}
+    <div class="subtle" style="margin-bottom:12px">
+      <h3 style="margin:0 0 8px">目标尾段分配视图</h3>
+      <div class="hint" style="margin-bottom:10px">这里专门看某个目标 Agent 的尾段已经被切出了多少、还剩多少，以及下一台 helper 应该怎么填。</div>
+      <div class="table">
+        <table>
+          <thead>
+            <tr>
+              <th>Target</th>
+              <th>原始范围</th>
+              <th>已分配尾段</th>
+              <th>今日有效结束组</th>
+              <th>下一段规则</th>
+            </tr>
+          </thead>
+          <tbody>
+          {% for plan in assist_target_plans %}
+            <tr>
+              <td>
+                <strong>{{ plan.target_agent_id }}</strong>
+                <div class="small">{{ plan.region or '-' }} / helper {{ plan.helper_count }} 台</div>
+              </td>
+              <td>{{ plan.target_group_start }} -> {{ plan.target_group_end }}</td>
+              <td>{{ plan.helper_segments_text }}</td>
+              <td>{{ plan.effective_target_group_end }}</td>
+              <td>
+                <div>{{ plan.next_segment_hint }}</div>
+                <div class="small">{{ plan.target_summary }}</div>
+              </td>
+            </tr>
+          {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    </div>
+    {% endif %}
+
     <div class="split">
       <div>
         <div class="table">
@@ -129,7 +166,7 @@ tr.active td{background:#f5f9ff}
 
       <div class="subtle">
         <h3 style="margin:0 0 8px">{{ selected_assist and '编辑临时协助任务' or '新建临时协助任务' }}</h3>
-        <div class="hint" style="margin-bottom:12px">第一版只支持尾段接手：`delegate_end` 必须等于目标 Agent 的原始 `group_end`。例如 `VM-1-1 -> VM-3-1, 91 -> 104`。</div>
+        <div class="hint" style="margin-bottom:12px">支持多台 helper 连续接手同一目标 Agent 的尾段任务。规则很简单：所有分片必须首尾相接、不能重叠、最后一段必须覆盖到目标 Agent 的原始 `group_end`。例如先分配 `91 -> 104`，再新增一台时就必须补成 `81 -> 90` 这类连续区间。</div>
         <form method="post" action="/console/assist/save{{ auth_query_suffix }}">
           <div class="fields">
             <div class="two">

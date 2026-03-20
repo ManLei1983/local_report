@@ -1414,6 +1414,128 @@ def reconcile_supervision_snapshot(
     }
 
 
+def build_progress_snapshot(
+    result_snapshot: Dict[str, Any],
+    heartbeat_snapshot: Dict[str, Any],
+) -> Dict[str, Any]:
+    heartbeat_group = max(0, parse_int(heartbeat_snapshot.get("status_group"), 0))
+    heartbeat_role = max(0, parse_int(heartbeat_snapshot.get("status_role_index"), 0))
+    heartbeat_date = str(heartbeat_snapshot.get("status_date", "") or "").strip()
+    heartbeat_time = parse_datetime_text(
+        str(
+            heartbeat_snapshot.get("last_progress_change_at", "")
+            or heartbeat_snapshot.get("server_time", "")
+            or ""
+        )
+    )
+
+    result_group = max(0, parse_int(result_snapshot.get("current_group"), 0))
+    result_role = max(0, parse_int(result_snapshot.get("role_index"), 0))
+    result_time = parse_datetime_text(str(result_snapshot.get("server_time", "") or ""))
+    selection_reason = ""
+
+    if heartbeat_group <= 0 and result_group <= 0:
+        return {
+            "group": 0,
+            "role_index": 0,
+            "status_date": heartbeat_date,
+            "source": "none",
+            "source_label": "-",
+            "note": "",
+            "heartbeat_group": heartbeat_group,
+            "result_group": result_group,
+        }
+
+    if heartbeat_group > 0 and result_group <= 0:
+        return {
+            "group": heartbeat_group,
+            "role_index": heartbeat_role,
+            "status_date": heartbeat_date,
+            "source": "heartbeat",
+            "source_label": "heartbeat",
+            "note": "\u5f53\u524d\u6309 heartbeat \u663e\u793a\u672c\u5730\u63a8\u8fdb",
+            "heartbeat_group": heartbeat_group,
+            "result_group": result_group,
+        }
+
+    if result_group > 0 and heartbeat_group <= 0:
+        return {
+            "group": result_group,
+            "role_index": result_role,
+            "status_date": heartbeat_date,
+            "source": "result",
+            "source_label": "\u7ed3\u679c\u4e0a\u62a5",
+            "note": "\u5f53\u524d\u6309\u7ed3\u679c\u4e0a\u62a5\u663e\u793a\u7ec4\u5b8c\u6210\u8fdb\u5ea6",
+            "heartbeat_group": heartbeat_group,
+            "result_group": result_group,
+        }
+
+    choose_result = False
+    choose_heartbeat = False
+    if result_time and heartbeat_time:
+        if result_time > heartbeat_time:
+            choose_result = True
+            selection_reason = "newer_timestamp"
+        elif heartbeat_time > result_time:
+            choose_heartbeat = True
+            selection_reason = "newer_timestamp"
+    elif result_time and not heartbeat_time:
+        choose_result = True
+        selection_reason = "newer_timestamp"
+    elif heartbeat_time and not result_time:
+        choose_heartbeat = True
+        selection_reason = "newer_timestamp"
+
+    if not choose_result and not choose_heartbeat:
+        if result_group > heartbeat_group or (
+            result_group == heartbeat_group and result_role > heartbeat_role
+        ):
+            choose_result = True
+            selection_reason = "higher_progress"
+        else:
+            choose_heartbeat = True
+            selection_reason = "higher_progress"
+
+    if choose_result:
+        note = ""
+        if heartbeat_group != result_group:
+            if selection_reason == "newer_timestamp":
+                note = f"\u7ed3\u679c\u4e0a\u62a5\u65f6\u95f4\u66f4\u65b0\uff1a{result_group}\uff1bheartbeat \u4ecd\u663e\u793a {heartbeat_group}"
+            else:
+                note = f"\u7ed3\u679c\u4e0a\u62a5\u7ec4\u53f7\u66f4\u9760\u524d\uff1a{result_group}\uff1bheartbeat \u4ecd\u505c\u5728 {heartbeat_group}"
+        elif result_role > heartbeat_role:
+            note = f"\u7ec4\u53f7\u4e00\u81f4\uff0c\u7ed3\u679c\u4e0a\u62a5\u89d2\u8272\u7d22\u5f15\u66f4\u9760\u524d\uff1a{result_role}"
+        return {
+            "group": result_group,
+            "role_index": result_role or heartbeat_role,
+            "status_date": heartbeat_date,
+            "source": "result",
+            "source_label": "\u7ed3\u679c\u4e0a\u62a5",
+            "note": note,
+            "heartbeat_group": heartbeat_group,
+            "result_group": result_group,
+        }
+
+    note = ""
+    if heartbeat_group != result_group:
+        if selection_reason == "newer_timestamp":
+            note = f"heartbeat \u8bc1\u636e\u66f4\u65b0\uff1a{heartbeat_group}\uff1b\u7ed3\u679c\u4e0a\u62a5\u4ecd\u663e\u793a {result_group}"
+        else:
+            note = f"heartbeat \u7ec4\u53f7\u66f4\u9760\u524d\uff1a{heartbeat_group}\uff1b\u7ed3\u679c\u4e0a\u62a5\u4ecd\u505c\u5728 {result_group}"
+    elif heartbeat_role > result_role:
+        note = f"\u7ec4\u53f7\u4e00\u81f4\uff0cheartbeat \u89d2\u8272\u7d22\u5f15\u66f4\u9760\u524d\uff1a{heartbeat_role}"
+    return {
+        "group": heartbeat_group,
+        "role_index": heartbeat_role or result_role,
+        "status_date": heartbeat_date,
+        "source": "heartbeat",
+        "source_label": "heartbeat",
+        "note": note,
+        "heartbeat_group": heartbeat_group,
+        "result_group": result_group,
+    }
+
+
 def build_dashboard_summary(rows: List[Dict[str, Any]]) -> Dict[str, int]:
     return {
         "agent_count": len(rows),
@@ -1915,6 +2037,110 @@ def build_target_assist_view(assist_rows: List[Dict[str, Any]]) -> Dict[str, Any
         "effective_target_group_end": effective_group_end,
         "summary": f"\u7531 {', '.join(helper_ids)} \u63a5\u624b {segment_text}\uff0c\u4eca\u65e5\u6709\u6548\u7ed3\u675f\u7ec4 {effective_group_end}",
     }
+
+
+def build_assist_target_plans(
+    agent_profiles: Optional[List[Dict[str, Any]]] = None,
+    assist_rows: Optional[List[Dict[str, Any]]] = None,
+    work_date: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    profile_items = agent_profiles if isinstance(agent_profiles, list) else list_agent_profiles()
+    profile_map = {
+        str(item.get("agent_id", "") or ""): item
+        for item in profile_items
+        if str(item.get("agent_id", "") or "").strip()
+    }
+    source_rows = (
+        assist_rows
+        if isinstance(assist_rows, list)
+        else list_active_assist_overrides(work_date=work_date)
+    )
+    grouped: Dict[str, List[Dict[str, Any]]] = {}
+    for row in source_rows:
+        target_agent_id = str(row.get("target_agent_id", "") or "").strip()
+        if not target_agent_id:
+            continue
+        grouped.setdefault(target_agent_id, []).append(row)
+
+    plans: List[Dict[str, Any]] = []
+    for target_agent_id, rows in grouped.items():
+        profile = profile_map.get(target_agent_id, {})
+        target_group_start = max(0, parse_int(profile.get("group_start"), 0))
+        target_group_end = max(0, parse_int(profile.get("group_end"), 0))
+        if target_group_end <= 0:
+            target_group_end = max(
+                max(0, parse_int(item.get("original_target_group_end"), 0))
+                for item in rows
+            )
+        region = str(
+            profile.get("region", "") or rows[0].get("region", "") or ""
+        ).strip()
+        sorted_rows = sorted(
+            rows,
+            key=lambda item: (
+                max(0, parse_int(item.get("delegate_start"), 0)),
+                max(0, parse_int(item.get("delegate_end"), 0)),
+                str(item.get("helper_agent_id", "") or ""),
+            ),
+        )
+        effective_group_end = compute_target_assist_effective_group_end(
+            target_group_end,
+            sorted_rows,
+        )
+        helper_segments = [
+            {
+                "helper_agent_id": str(item.get("helper_agent_id", "") or "").strip(),
+                "delegate_start": max(0, parse_int(item.get("delegate_start"), 0)),
+                "delegate_end": max(0, parse_int(item.get("delegate_end"), 0)),
+            }
+            for item in sorted_rows
+        ]
+        helper_segments_text = " / ".join(
+            f"{item['helper_agent_id']}:{item['delegate_start']}->{item['delegate_end']}"
+            for item in helper_segments
+        )
+        next_delegate_end = (
+            effective_group_end if effective_group_end > target_group_start else 0
+        )
+        next_delegate_start_min = target_group_start + 1 if next_delegate_end > 0 else 0
+        next_delegate_start_max = next_delegate_end if next_delegate_end > 0 else 0
+        if next_delegate_end > target_group_start:
+            next_segment_hint = (
+                f"新增 helper 时，delegate_end 必须填 {next_delegate_end}，"
+                f"delegate_start 可填 {next_delegate_start_min} ~ {next_delegate_start_max}"
+            )
+        else:
+            next_segment_hint = "已覆盖到目标起始边界，不能继续向前下切"
+        plans.append(
+            {
+                "target_agent_id": target_agent_id,
+                "region": region,
+                "target_group_start": target_group_start,
+                "target_group_end": target_group_end,
+                "effective_target_group_end": effective_group_end,
+                "helper_count": len(helper_segments),
+                "helper_segments": helper_segments,
+                "helper_segments_text": helper_segments_text,
+                "next_delegate_end": next_delegate_end,
+                "next_delegate_start_min": next_delegate_start_min,
+                "next_delegate_start_max": next_delegate_start_max,
+                "next_segment_hint": next_segment_hint,
+                "can_extend_tail": next_delegate_end > target_group_start,
+                "target_summary": build_target_assist_view(sorted_rows).get("summary", ""),
+            }
+        )
+
+    plans.sort(
+        key=lambda item: (
+            extract_region_number(str(item.get("region", "") or "")) is None,
+            extract_region_number(str(item.get("region", "") or ""))
+            if extract_region_number(str(item.get("region", "") or "")) is not None
+            else float("inf"),
+            str(item.get("region", "") or ""),
+            str(item.get("target_agent_id", "") or ""),
+        )
+    )
+    return plans
 
 
 def get_active_assist_for_target(
@@ -2578,9 +2804,9 @@ def build_rows() -> List[Dict[str, Any]]:
             or ""
         ).strip()
         region_number = extract_region_number(region)
-        progress_group = heartbeat_snapshot["status_group"] or result_snapshot["current_group"]
-        progress_role_index = (
-            heartbeat_snapshot["status_role_index"] or result_snapshot["role_index"]
+        progress_snapshot = build_progress_snapshot(
+            result_snapshot,
+            heartbeat_snapshot,
         )
         rows.append(
             {
@@ -2610,9 +2836,14 @@ def build_rows() -> List[Dict[str, Any]]:
                 "result_detail": result_snapshot["detail"],
                 "result_elapsed": result_snapshot["elapsed"],
                 "result_server_time": result_snapshot["server_time"],
-                "progress_group": progress_group,
-                "progress_role_index": progress_role_index,
-                "status_date": heartbeat_snapshot["status_date"],
+                "progress_group": progress_snapshot["group"],
+                "progress_role_index": progress_snapshot["role_index"],
+                "progress_source": progress_snapshot["source"],
+                "progress_source_label": progress_snapshot["source_label"],
+                "progress_note": progress_snapshot["note"],
+                "progress_heartbeat_group": progress_snapshot["heartbeat_group"],
+                "progress_result_group": progress_snapshot["result_group"],
+                "status_date": progress_snapshot["status_date"],
                 "status_exists": heartbeat_snapshot["status_exists"],
                 "process_exists": heartbeat_snapshot["process_exists"],
                 "process_pid": heartbeat_snapshot["process_pid"],
@@ -2983,6 +3214,10 @@ async def config_console(
     selected_agent = get_agent_profile(edit_agent or "") or blank_agent_profile()
     selected_resource = get_resource_item(edit_resource_id) or blank_resource_item()
     active_assists = list_active_assist_overrides()
+    assist_target_plans = build_assist_target_plans(
+        agent_profiles=agent_profiles,
+        assist_rows=active_assists,
+    )
 
     assist_seed_helper = str(
         edit_assist_helper or selected_agent.get("agent_id", "") or ""
@@ -3027,6 +3262,7 @@ async def config_console(
             "selected_agent": selected_agent,
             "selected_resource": selected_resource,
             "active_assists": active_assists,
+            "assist_target_plans": assist_target_plans,
             "selected_assist": selected_assist or {},
             "assist_form": assist_form,
             "dashboard_url": append_query_params("/", auth_token=auth_token),
