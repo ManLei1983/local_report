@@ -370,8 +370,9 @@ def init_db() -> None:
             )
             """
         )
+        db_conn.execute("DROP INDEX IF EXISTS idx_assist_target_date")
         db_conn.execute(
-            "CREATE UNIQUE INDEX IF NOT EXISTS idx_assist_target_date ON agent_assist_overrides(work_date, target_agent_id)"
+            "CREATE INDEX IF NOT EXISTS idx_assist_target_date ON agent_assist_overrides(work_date, target_agent_id)"
         )
         db_conn.execute(
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_assist_helper_date ON agent_assist_overrides(work_date, helper_agent_id)"
@@ -1772,15 +1773,16 @@ def row_to_assist_override(row: sqlite3.Row) -> Dict[str, Any]:
     }
 
 
-def get_active_assist_for_target(
+
+def list_active_assists_for_target(
     agent_id: str,
     work_date: Optional[str] = None,
-) -> Optional[Dict[str, Any]]:
+) -> List[Dict[str, Any]]:
     if not db_conn or not agent_id:
-        return None
+        return []
     effective_date = str(work_date or today_str())
     with db_lock:
-        row = db_conn.execute(
+        rows = db_conn.execute(
             """
             SELECT id, work_date, target_agent_id, helper_agent_id, region,
                    delegate_start, delegate_end,
@@ -1788,10 +1790,141 @@ def get_active_assist_for_target(
                    created_at, updated_at
             FROM agent_assist_overrides
             WHERE work_date = ? AND target_agent_id = ?
+            ORDER BY delegate_start ASC, delegate_end ASC, helper_agent_id ASC
             """,
             (effective_date, agent_id),
-        ).fetchone()
-    return row_to_assist_override(row) if row else None
+        ).fetchall()
+    return [row_to_assist_override(row) for row in rows]
+
+
+def validate_target_assist_segments(
+    target_group_start: int,
+    target_group_end: int,
+    assist_rows: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    sorted_rows = sorted(
+        assist_rows,
+        key=lambda item: (
+            max(0, parse_int(item.get("delegate_start"), 0)),
+            max(0, parse_int(item.get("delegate_end"), 0)),
+            str(item.get("helper_agent_id", "") or ""),
+        ),
+    )
+    if not sorted_rows:
+        return []
+
+    previous_row: Optional[Dict[str, Any]] = None
+    for row in sorted_rows:
+        delegate_start = max(0, parse_int(row.get("delegate_start"), 0))
+        delegate_end = max(0, parse_int(row.get("delegate_end"), 0))
+        if delegate_start <= target_group_start:
+            raise ValueError(
+                f"delegate_start \u5fc5\u987b\u5927\u4e8e\u76ee\u6807\u8d77\u59cb\u7ec4 {target_group_start}"
+            )
+        if delegate_end < delegate_start:
+            raise ValueError("delegate_end \u4e0d\u80fd\u5c0f\u4e8e delegate_start")
+        if delegate_end > target_group_end:
+            raise ValueError(
+                f"\u534f\u52a9\u5206\u7247 {delegate_start}->{delegate_end} \u8d85\u51fa\u76ee\u6807\u7ed3\u675f\u7ec4 {target_group_end}"
+            )
+        if previous_row is not None:
+            previous_start = max(0, parse_int(previous_row.get("delegate_start"), 0))
+            previous_end = max(0, parse_int(previous_row.get("delegate_end"), 0))
+            if delegate_start <= previous_end:
+                raise ValueError(
+                    f"\u534f\u52a9\u5206\u7247\u4e0d\u80fd\u91cd\u53e0\uff1a{previous_start}->{previous_end} \u4e0e {delegate_start}->{delegate_end} \u51b2\u7a81"
+                )
+            if delegate_start != previous_end + 1:
+                raise ValueError(
+                    f"\u534f\u52a9\u5206\u7247\u5fc5\u987b\u8fde\u7eed\u8986\u76d6\u5c3e\u6bb5\uff1a{previous_start}->{previous_end} \u4e4b\u540e\u5e94\u4ece {previous_end + 1} \u5f00\u59cb\uff0c\u5f53\u524d\u586b\u5199\u4e3a {delegate_start}->{delegate_end}"
+                )
+        previous_row = row
+
+    last_end = max(0, parse_int(sorted_rows[-1].get("delegate_end"), 0))
+    if last_end != target_group_end:
+        raise ValueError(
+            f"\u534f\u52a9\u5206\u7247\u5fc5\u987b\u8986\u76d6\u5230\u76ee\u6807\u7ed3\u675f\u7ec4 {target_group_end}\uff0c\u6700\u540e\u4e00\u6bb5\u5f53\u524d\u53ea\u5230 {last_end}"
+        )
+    return sorted_rows
+
+
+def compute_target_assist_effective_group_end(
+    target_group_end: int,
+    assist_rows: List[Dict[str, Any]],
+) -> int:
+    if not assist_rows:
+        return max(0, target_group_end)
+    sorted_rows = sorted(
+        assist_rows,
+        key=lambda item: max(0, parse_int(item.get("delegate_start"), 0)),
+    )
+    return max(0, parse_int(sorted_rows[0].get("delegate_start"), 0) - 1)
+
+
+def sync_target_assist_effective_group_end(
+    target_agent_id: str,
+    work_date: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    assist_rows = list_active_assists_for_target(target_agent_id, work_date=work_date)
+    if not assist_rows:
+        return []
+    effective_date = str(work_date or today_str())
+    effective_group_end = compute_target_assist_effective_group_end(
+        max(0, parse_int(assist_rows[-1].get("original_target_group_end"), 0)),
+        assist_rows,
+    )
+    with db_lock:
+        with db_conn:
+            db_conn.execute(
+                "UPDATE agent_assist_overrides SET effective_target_group_end = ? WHERE work_date = ? AND target_agent_id = ?",
+                (effective_group_end, effective_date, target_agent_id),
+            )
+    for row in assist_rows:
+        row["effective_target_group_end"] = effective_group_end
+    return assist_rows
+
+
+def build_target_assist_view(assist_rows: List[Dict[str, Any]]) -> Dict[str, Any]:
+    if not assist_rows:
+        return build_assist_view(None)
+    sorted_rows = sorted(
+        assist_rows,
+        key=lambda item: max(0, parse_int(item.get("delegate_start"), 0)),
+    )
+    effective_group_end = compute_target_assist_effective_group_end(
+        max(0, parse_int(sorted_rows[-1].get("original_target_group_end"), 0)),
+        sorted_rows,
+    )
+    helper_ids = [str(row.get("helper_agent_id", "") or "") for row in sorted_rows]
+    segment_text = ", ".join(
+        f"{parse_int(row.get('delegate_start'), 0)}->{parse_int(row.get('delegate_end'), 0)}"
+        for row in sorted_rows
+    )
+    if len(sorted_rows) == 1:
+        row = dict(sorted_rows[0])
+        row["effective_target_group_end"] = effective_group_end
+        return build_assist_view(row, role="target")
+    return {
+        **sorted_rows[0],
+        "active": True,
+        "role": "target",
+        "helper_agent_ids": helper_ids,
+        "helper_count": len(helper_ids),
+        "delegate_start": parse_int(sorted_rows[0].get("delegate_start"), 0),
+        "delegate_end": parse_int(sorted_rows[-1].get("delegate_end"), 0),
+        "effective_target_group_end": effective_group_end,
+        "summary": f"\u7531 {', '.join(helper_ids)} \u63a5\u624b {segment_text}\uff0c\u4eca\u65e5\u6709\u6548\u7ed3\u675f\u7ec4 {effective_group_end}",
+    }
+
+
+def get_active_assist_for_target(
+    agent_id: str,
+    work_date: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
+    assist_rows = list_active_assists_for_target(agent_id, work_date=work_date)
+    if not assist_rows:
+        return None
+    return build_target_assist_view(assist_rows)
 
 
 def get_active_assist_for_helper(
@@ -1831,7 +1964,7 @@ def list_active_assist_overrides(
                    created_at, updated_at
             FROM agent_assist_overrides
             WHERE work_date = ?
-            ORDER BY updated_at DESC, helper_agent_id ASC, target_agent_id ASC
+            ORDER BY target_agent_id ASC, delegate_start ASC, helper_agent_id ASC
             """,
             (effective_date,),
         ).fetchall()
@@ -2002,10 +2135,6 @@ def upsert_assist_override(payload: AssistAssignPayload) -> Dict[str, Any]:
         raise ValueError("delegate_end \u4e0d\u80fd\u5c0f\u4e8e delegate_start")
     if target_group_end <= 0:
         raise ValueError("\u76ee\u6807 Agent \u672a\u914d\u7f6e\u6709\u6548\u7684\u7ed3\u675f\u7ec4")
-    if delegate_end != target_group_end:
-        raise ValueError(
-            f"\u7b2c\u4e00\u7248\u53ea\u652f\u6301\u5c3e\u6bb5\u63a5\u624b\uff0cdelegate_end \u5fc5\u987b\u7b49\u4e8e\u76ee\u6807\u7ed3\u675f\u7ec4 {target_group_end}"
-        )
     if delegate_start <= target_group_start:
         raise ValueError(
             f"delegate_start \u5fc5\u987b\u5927\u4e8e\u76ee\u6807\u8d77\u59cb\u7ec4 {target_group_start}"
@@ -2016,11 +2145,6 @@ def upsert_assist_override(payload: AssistAssignPayload) -> Dict[str, Any]:
         raise ValueError(
             f"\u534f\u52a9 Agent {helper_agent_id} \u4eca\u5929\u5df2\u7ecf\u5728\u534f\u52a9 {helper_active.get('target_agent_id')}"
         )
-    target_active = get_active_assist_for_target(target_agent_id)
-    if target_active and target_active.get("helper_agent_id") != helper_agent_id:
-        raise ValueError(
-            f"\u76ee\u6807 Agent {target_agent_id} \u4eca\u5929\u5df2\u7ecf\u88ab {target_active.get('helper_agent_id')} \u63a5\u624b"
-        )
 
     latest_progress = get_latest_agent_progress(target_agent_id)
     if parse_int(latest_progress.get("group"), 0) >= delegate_start:
@@ -2028,7 +2152,28 @@ def upsert_assist_override(payload: AssistAssignPayload) -> Dict[str, Any]:
             f"\u76ee\u6807 Agent {target_agent_id} \u5f53\u524d\u8fdb\u5ea6\u5df2\u5230 {latest_progress.get('group', 0)}\uff0c\u4e0d\u80fd\u518d\u5206\u914d {delegate_start}->{delegate_end}"
         )
 
-    effective_group_end = delegate_start - 1
+    existing_target_assists = [
+        row
+        for row in list_active_assists_for_target(target_agent_id)
+        if str(row.get("helper_agent_id", "") or "") != helper_agent_id
+    ]
+    proposed_assist = {
+        "target_agent_id": target_agent_id,
+        "helper_agent_id": helper_agent_id,
+        "delegate_start": delegate_start,
+        "delegate_end": delegate_end,
+        "original_target_group_end": target_group_end,
+    }
+    combined_target_assists = validate_target_assist_segments(
+        target_group_start,
+        target_group_end,
+        existing_target_assists + [proposed_assist],
+    )
+    effective_group_end = compute_target_assist_effective_group_end(
+        target_group_end,
+        combined_target_assists,
+    )
+
     region = validate_assist_region(
         str(target_profile.get("region", "") or ""),
         str(payload.region or ""),
@@ -2039,8 +2184,8 @@ def upsert_assist_override(payload: AssistAssignPayload) -> Dict[str, Any]:
     with db_lock:
         with db_conn:
             db_conn.execute(
-                "DELETE FROM agent_assist_overrides WHERE work_date = ? AND (target_agent_id = ? OR helper_agent_id = ?)",
-                (work_date, target_agent_id, helper_agent_id),
+                "DELETE FROM agent_assist_overrides WHERE work_date = ? AND helper_agent_id = ?",
+                (work_date, helper_agent_id),
             )
             db_conn.execute(
                 """
@@ -2064,6 +2209,10 @@ def upsert_assist_override(payload: AssistAssignPayload) -> Dict[str, Any]:
                     current_time,
                 ),
             )
+            db_conn.execute(
+                "UPDATE agent_assist_overrides SET effective_target_group_end = ? WHERE work_date = ? AND target_agent_id = ?",
+                (effective_group_end, work_date, target_agent_id),
+            )
             row = db_conn.execute(
                 """
                 SELECT id, work_date, target_agent_id, helper_agent_id, region,
@@ -2071,9 +2220,9 @@ def upsert_assist_override(payload: AssistAssignPayload) -> Dict[str, Any]:
                        original_target_group_end, effective_target_group_end,
                        created_at, updated_at
                 FROM agent_assist_overrides
-                WHERE work_date = ? AND target_agent_id = ?
+                WHERE work_date = ? AND helper_agent_id = ?
                 """,
-                (work_date, target_agent_id),
+                (work_date, helper_agent_id),
             ).fetchone()
     return row_to_assist_override(row)
 
@@ -2100,9 +2249,18 @@ def clear_assist_override(
         params.append(target_agent_id)
     sql = "DELETE FROM agent_assist_overrides WHERE " + " AND ".join(clauses)
     with db_lock:
+        rows = db_conn.execute(
+            "SELECT DISTINCT target_agent_id FROM agent_assist_overrides WHERE " + " AND ".join(clauses),
+            tuple(params),
+        ).fetchall()
         with db_conn:
             cur = db_conn.execute(sql, tuple(params))
-            return cur.rowcount
+            deleted_count = cur.rowcount
+    affected_targets = [str(row["target_agent_id"] or "") for row in rows if row["target_agent_id"]]
+    for target_id in affected_targets:
+        sync_target_assist_effective_group_end(target_id, work_date=effective_date)
+    return deleted_count
+
 
 
 def build_agent_task_context(
@@ -2152,7 +2310,7 @@ def build_agent_task_context(
                 context["group_end"],
             ),
         )
-        context["assist"] = build_assist_view(target_assist, role="target")
+        context["assist"] = target_assist
     return context
 
 
