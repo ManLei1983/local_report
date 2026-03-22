@@ -892,16 +892,15 @@ def ensure_runtime_state_for_today() -> None:
         current_runtime_day = today
 
 
-def build_agent_runtime_snapshot(agent_id: str) -> Dict[str, Any]:
-    ensure_runtime_state_for_today()
-    now_ts = time.time()
-    with state_lock:
-        item = dict(agent_states.get(agent_id, {}))
-        heartbeat_item = dict(heartbeat_states.get(agent_id, {}))
-
-    agent_profile = get_agent_profile(agent_id)
+def build_agent_runtime_snapshot_from_state(
+    agent_profile: Optional[Dict[str, Any]],
+    report_item: Optional[Dict[str, Any]],
+    heartbeat_item: Optional[Dict[str, Any]],
+    now_ts: Optional[float] = None,
+) -> Dict[str, Any]:
+    current_ts = time.time() if now_ts is None else now_ts
     task_context = build_agent_task_context(agent_profile)
-    if not item:
+    if not report_item:
         return {
             "has_report": False,
             "report_timeout_seconds": settings.alert_timeout_seconds,
@@ -923,13 +922,13 @@ def build_agent_runtime_snapshot(agent_id: str) -> Dict[str, Any]:
             "assist": task_context.get("assist", build_assist_view(None)),
         }
 
-    completion_state = get_completion_state(agent_profile, item)
-    elapsed = int(max(0, now_ts - float(item.get("server_epoch", 0))))
+    completion_state = get_completion_state(agent_profile, report_item)
+    elapsed = int(max(0, current_ts - float(report_item.get("server_epoch", 0))))
     result_stale = False if completion_state["completed"] else elapsed > settings.alert_timeout_seconds
     supervision_snapshot = build_supervision_snapshot(
         agent_profile,
         heartbeat_item or None,
-        now_ts=now_ts,
+        now_ts=current_ts,
     )
     actionable_stale = should_alert_for_result_stale(
         result_stale,
@@ -942,19 +941,35 @@ def build_agent_runtime_snapshot(agent_id: str) -> Dict[str, Any]:
         "result_stale": result_stale,
         "stale_suppressed": bool(result_stale and not actionable_stale),
         "elapsed": elapsed,
-        "server_time": item.get("server_time", ""),
-        "server_epoch": item.get("server_epoch", 0),
-        "current_group": item.get("current_group", 0),
-        "finished_group": item.get("finished_group", 0),
-        "next_group": item.get("next_group", 0),
-        "role_index": item.get("role_index", 0),
-        "event": item.get("event", ""),
+        "server_time": report_item.get("server_time", ""),
+        "server_epoch": report_item.get("server_epoch", 0),
+        "current_group": report_item.get("current_group", 0),
+        "finished_group": report_item.get("finished_group", 0),
+        "next_group": report_item.get("next_group", 0),
+        "role_index": report_item.get("role_index", 0),
+        "event": report_item.get("event", ""),
         "completed": completion_state["completed"],
         "target_group_end": completion_state["target_group_end"],
         "complete_role_index": completion_state["complete_role_index"],
         "completion_basis": completion_state["completion_basis"],
         "assist": task_context.get("assist", build_assist_view(None)),
     }
+
+
+def build_agent_runtime_snapshot(agent_id: str) -> Dict[str, Any]:
+    ensure_runtime_state_for_today()
+    now_ts = time.time()
+    with state_lock:
+        item = dict(agent_states.get(agent_id, {}))
+        heartbeat_item = dict(heartbeat_states.get(agent_id, {}))
+
+    agent_profile = get_agent_profile(agent_id)
+    return build_agent_runtime_snapshot_from_state(
+        agent_profile,
+        item or None,
+        heartbeat_item or None,
+        now_ts=now_ts,
+    )
 
 
 SUPERVISION_ISSUE_CODES = {"suspected_stuck", "startup_failed"}
@@ -1534,6 +1549,113 @@ def build_progress_snapshot(
         "heartbeat_group": heartbeat_group,
         "result_group": result_group,
     }
+
+
+def build_agent_row_snapshot(
+    agent_id: str,
+    agent_profile: Optional[Dict[str, Any]],
+    report_item: Optional[Dict[str, Any]],
+    heartbeat_item: Optional[Dict[str, Any]],
+    now_ts: Optional[float] = None,
+) -> Dict[str, Any]:
+    current_ts = time.time() if now_ts is None else now_ts
+    profile = agent_profile or {}
+    task_context = build_agent_task_context(profile)
+    alert_snapshot = build_agent_runtime_snapshot_from_state(
+        profile,
+        report_item,
+        heartbeat_item,
+        now_ts=current_ts,
+    )
+    result_snapshot = build_result_snapshot(profile, report_item, now_ts=current_ts)
+    supervision_snapshot = build_supervision_snapshot(
+        profile,
+        heartbeat_item,
+        now_ts=current_ts,
+    )
+    heartbeat_snapshot = build_heartbeat_snapshot(heartbeat_item, now_ts=current_ts)
+    supervision_snapshot = reconcile_supervision_snapshot(
+        profile,
+        supervision_snapshot,
+        result_snapshot,
+        heartbeat_snapshot,
+    )
+
+    region = str(
+        (report_item or {}).get("region")
+        or task_context.get("region")
+        or profile.get("region")
+        or ""
+    ).strip()
+    region_number = extract_region_number(region)
+    progress_snapshot = build_progress_snapshot(
+        result_snapshot,
+        heartbeat_snapshot,
+    )
+    return {
+        "event": str((report_item or {}).get("event", "") or "-"),
+        "agent_id": agent_id,
+        "region": region,
+        "region_number": region_number,
+        "current_group": result_snapshot["current_group"],
+        "finished_group": result_snapshot["finished_group"],
+        "next_group": result_snapshot["next_group"],
+        "role_index": result_snapshot["role_index"],
+        "client_ts": (report_item or {}).get("client_ts", ""),
+        "server_time": (report_item or {}).get("server_time", ""),
+        "elapsed": alert_snapshot["elapsed"],
+        "stale": alert_snapshot["stale"],
+        "completed": alert_snapshot["completed"],
+        "target_group_end": alert_snapshot["target_group_end"],
+        "complete_role_index": alert_snapshot["complete_role_index"],
+        "completion_basis": alert_snapshot["completion_basis"],
+        "supervision_state": supervision_snapshot["state_label"],
+        "supervision_code": supervision_snapshot["state_code"],
+        "supervision_detail": supervision_snapshot["detail"],
+        "supervision_heartbeat_elapsed": supervision_snapshot["heartbeat_elapsed"],
+        "action_text": supervision_snapshot["action_text"],
+        "result_state": result_snapshot["state_label"],
+        "result_code": result_snapshot["state_code"],
+        "result_detail": result_snapshot["detail"],
+        "result_elapsed": result_snapshot["elapsed"],
+        "result_server_time": result_snapshot["server_time"],
+        "progress_group": progress_snapshot["group"],
+        "progress_role_index": progress_snapshot["role_index"],
+        "progress_source": progress_snapshot["source"],
+        "progress_source_label": progress_snapshot["source_label"],
+        "progress_note": progress_snapshot["note"],
+        "progress_heartbeat_group": progress_snapshot["heartbeat_group"],
+        "progress_result_group": progress_snapshot["result_group"],
+        "status_date": progress_snapshot["status_date"],
+        "status_exists": heartbeat_snapshot["status_exists"],
+        "process_exists": heartbeat_snapshot["process_exists"],
+        "process_pid": heartbeat_snapshot["process_pid"],
+        "heartbeat_at": heartbeat_snapshot["server_time"],
+        "heartbeat_elapsed": heartbeat_snapshot["heartbeat_elapsed"],
+        "last_progress_change_at": heartbeat_snapshot["last_progress_change_at"],
+        "last_restart_at": heartbeat_snapshot["last_restart_at"],
+        "restart_count_today": heartbeat_snapshot["restart_count_today"],
+        "assist_active": bool(task_context.get("assist", {}).get("active", False)),
+        "assist_role": str(task_context.get("assist", {}).get("role", "") or ""),
+        "assist_summary": str(task_context.get("assist", {}).get("summary", "") or ""),
+    }
+
+
+def build_current_agent_row(agent_id: str, now_ts: Optional[float] = None) -> Optional[Dict[str, Any]]:
+    ensure_runtime_state_for_today()
+    with state_lock:
+        report_item = dict(agent_states.get(agent_id, {}))
+        heartbeat_item = dict(heartbeat_states.get(agent_id, {}))
+    if not report_item and not heartbeat_item:
+        return None
+    agent_profile = get_agent_profile(agent_id)
+    return build_agent_row_snapshot(
+        agent_id,
+        agent_profile,
+        report_item or None,
+        heartbeat_item or None,
+        now_ts=now_ts,
+    )
 
 
 def build_dashboard_summary(rows: List[Dict[str, Any]]) -> Dict[str, int]:
@@ -2780,82 +2902,14 @@ def build_rows() -> List[Dict[str, Any]]:
         report_item = report_values.get(agent_id)
         heartbeat_item = heartbeat_values.get(agent_id)
         agent_profile = profiles.get(str(agent_id), {})
-        task_context = build_agent_task_context(agent_profile)
-
-        alert_snapshot = build_agent_runtime_snapshot(agent_id)
-        result_snapshot = build_result_snapshot(agent_profile, report_item, now_ts=now_ts)
-        supervision_snapshot = build_supervision_snapshot(
-            agent_profile,
-            heartbeat_item,
-            now_ts=now_ts,
-        )
-        heartbeat_snapshot = build_heartbeat_snapshot(heartbeat_item, now_ts=now_ts)
-        supervision_snapshot = reconcile_supervision_snapshot(
-            agent_profile,
-            supervision_snapshot,
-            result_snapshot,
-            heartbeat_snapshot,
-        )
-
-        region = str(
-            (report_item or {}).get("region")
-            or task_context.get("region")
-            or agent_profile.get("region")
-            or ""
-        ).strip()
-        region_number = extract_region_number(region)
-        progress_snapshot = build_progress_snapshot(
-            result_snapshot,
-            heartbeat_snapshot,
-        )
         rows.append(
-            {
-                "event": str((report_item or {}).get("event", "") or "-"),
-                "agent_id": agent_id,
-                "region": region,
-                "region_number": region_number,
-                "current_group": result_snapshot["current_group"],
-                "finished_group": result_snapshot["finished_group"],
-                "next_group": result_snapshot["next_group"],
-                "role_index": result_snapshot["role_index"],
-                "client_ts": (report_item or {}).get("client_ts", ""),
-                "server_time": (report_item or {}).get("server_time", ""),
-                "elapsed": alert_snapshot["elapsed"],
-                "stale": alert_snapshot["stale"],
-                "completed": alert_snapshot["completed"],
-                "target_group_end": alert_snapshot["target_group_end"],
-                "complete_role_index": alert_snapshot["complete_role_index"],
-                "completion_basis": alert_snapshot["completion_basis"],
-                "supervision_state": supervision_snapshot["state_label"],
-                "supervision_code": supervision_snapshot["state_code"],
-                "supervision_detail": supervision_snapshot["detail"],
-                "supervision_heartbeat_elapsed": supervision_snapshot["heartbeat_elapsed"],
-                "action_text": supervision_snapshot["action_text"],
-                "result_state": result_snapshot["state_label"],
-                "result_code": result_snapshot["state_code"],
-                "result_detail": result_snapshot["detail"],
-                "result_elapsed": result_snapshot["elapsed"],
-                "result_server_time": result_snapshot["server_time"],
-                "progress_group": progress_snapshot["group"],
-                "progress_role_index": progress_snapshot["role_index"],
-                "progress_source": progress_snapshot["source"],
-                "progress_source_label": progress_snapshot["source_label"],
-                "progress_note": progress_snapshot["note"],
-                "progress_heartbeat_group": progress_snapshot["heartbeat_group"],
-                "progress_result_group": progress_snapshot["result_group"],
-                "status_date": progress_snapshot["status_date"],
-                "status_exists": heartbeat_snapshot["status_exists"],
-                "process_exists": heartbeat_snapshot["process_exists"],
-                "process_pid": heartbeat_snapshot["process_pid"],
-                "heartbeat_at": heartbeat_snapshot["server_time"],
-                "heartbeat_elapsed": heartbeat_snapshot["heartbeat_elapsed"],
-                "last_progress_change_at": heartbeat_snapshot["last_progress_change_at"],
-                "last_restart_at": heartbeat_snapshot["last_restart_at"],
-                "restart_count_today": heartbeat_snapshot["restart_count_today"],
-                "assist_active": bool(task_context.get("assist", {}).get("active", False)),
-                "assist_role": str(task_context.get("assist", {}).get("role", "") or ""),
-                "assist_summary": str(task_context.get("assist", {}).get("summary", "") or ""),
-            }
+            build_agent_row_snapshot(
+                agent_id,
+                agent_profile,
+                report_item,
+                heartbeat_item,
+                now_ts=now_ts,
+            )
         )
 
     rows.sort(
@@ -3086,11 +3140,50 @@ async def check_alerts_once() -> None:
                 last_alert_sent_at.pop(agent_id, None)
 
             last_sent = last_alert_sent_at.get(agent_id, 0.0)
-            cooldown_seconds = get_alert_cooldown_seconds(agent_id, now_ts)
-            if (now_ts - last_sent) >= cooldown_seconds:
+            confirm_ts = time.time()
+            cooldown_seconds = get_alert_cooldown_seconds(agent_id, confirm_ts)
+            if (confirm_ts - last_sent) >= cooldown_seconds:
+                latest_row = build_current_agent_row(agent_id, now_ts=confirm_ts)
+                if latest_row is None:
+                    stale_state[agent_id] = False
+                    alert_stale_started_at.pop(agent_id, None)
+                    alert_sent_count.pop(agent_id, None)
+                    last_alert_sent_at.pop(agent_id, None)
+                    continue
+
+                latest_elapsed = latest_row["elapsed"]
+                latest_result_stale = bool(latest_row.get("result_code") == "stale")
+                latest_alert_stale = bool(latest_row.get("stale", False))
+                latest_completed = bool(latest_row.get("completed", False))
+                if latest_completed:
+                    stale_state[agent_id] = False
+                    alert_stale_started_at.pop(agent_id, None)
+                    alert_sent_count.pop(agent_id, None)
+                    last_alert_sent_at.pop(agent_id, None)
+                    continue
+
+                if not latest_alert_stale:
+                    if not latest_result_stale:
+                        if prev_stale:
+                            ok = await post_wecom_markdown(
+                                build_recover_markdown(latest_row, latest_elapsed)
+                            )
+                            if ok:
+                                logger.info(
+                                    "recover alert sent during timeout recheck: agent=%s",
+                                    agent_id,
+                                )
+                        stale_state[agent_id] = False
+                        alert_stale_started_at.pop(agent_id, None)
+                        alert_sent_count.pop(agent_id, None)
+                        last_alert_sent_at.pop(agent_id, None)
+                    continue
+
+                row = latest_row
+                elapsed = latest_elapsed
                 ok = await post_wecom_markdown(build_timeout_markdown(row, elapsed))
                 if ok:
-                    last_alert_sent_at[agent_id] = now_ts
+                    last_alert_sent_at[agent_id] = confirm_ts
                     alert_sent_count[agent_id] = alert_sent_count.get(agent_id, 0) + 1
                     logger.warning(
                         "timeout alert sent: agent=%s elapsed=%s cooldown=%s count=%s",
