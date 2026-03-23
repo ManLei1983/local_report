@@ -38,7 +38,7 @@ if ($IncludeDb -and (Test-Path "$root\local_report.db")) {
     Copy-Item "$root\local_report.db" "$releaseDir\local_report.db" -Force
 }
 
-@"
+@'
 @echo off
 setlocal
 cd /d "%~dp0"
@@ -57,9 +57,9 @@ if %ERRORLEVEL%==20 exit /b 1
 
 powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -Command "Start-Process -FilePath '%TARGET_EXE%' -WorkingDirectory '%~dp0' -WindowStyle Hidden"
 exit /b 0
-"@ | Set-Content -Path (Join-Path $releaseDir "start_local_report.bat") -Encoding ASCII
+'@ | Set-Content -Path (Join-Path $releaseDir "start_local_report.bat") -Encoding ASCII
 
-@"
+@'
 @echo off
 setlocal
 cd /d "%~dp0"
@@ -77,7 +77,7 @@ if errorlevel 1 (
     exit /b 1
 )
 exit /b 0
-"@ | Set-Content -Path (Join-Path $releaseDir "stop_local_report.bat") -Encoding ASCII
+'@ | Set-Content -Path (Join-Path $releaseDir "stop_local_report.bat") -Encoding ASCII
 
 if ($Zip) {
     $zipPath = Join-Path $distRoot ("{0}_{1}.zip" -f $releaseName, (Get-Date -Format "yyyyMMdd_HHmmss"))
