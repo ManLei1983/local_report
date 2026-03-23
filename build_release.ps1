@@ -43,16 +43,19 @@ if ($IncludeDb -and (Test-Path "$root\local_report.db")) {
 setlocal
 cd /d "%~dp0"
 
-if not exist "%~dp0local_report_server.exe" (
+set "TARGET_EXE=%~dp0local_report_server.exe"
+
+if not exist "%TARGET_EXE%" (
     echo [ERROR] local_report_server.exe not found
     pause
     exit /b 1
 )
 
-tasklist /FI "IMAGENAME eq local_report_server.exe" 2>NUL | find /I "local_report_server.exe" >NUL
-if not errorlevel 1 exit /b 0
+powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "$target = [System.IO.Path]::GetFullPath('%TARGET_EXE%'); $items = @(Get-CimInstance Win32_Process -Filter 'name = ''local_report_server.exe''' -ErrorAction SilentlyContinue); if (-not $items) { exit 0 }; $same = @($items | Where-Object { $_.ExecutablePath -and [string]::Equals($_.ExecutablePath, $target, [System.StringComparison]::OrdinalIgnoreCase) }); if ($same.Count -gt 0) { exit 10 }; $other = @($items | Where-Object { -not ($_.ExecutablePath -and [string]::Equals($_.ExecutablePath, $target, [System.StringComparison]::OrdinalIgnoreCase)) }); if ($other.Count -gt 0) { Write-Host '[ERROR] another local_report_server.exe is already running:'; $other | ForEach-Object { if ($_.ExecutablePath) { Write-Host ('  ' + $_.ExecutablePath) } else { Write-Host '  <unknown path>' } }; exit 20 }; exit 0"
+if %ERRORLEVEL%==10 exit /b 0
+if %ERRORLEVEL%==20 exit /b 1
 
-powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -Command "Start-Process -FilePath '%~dp0local_report_server.exe' -WorkingDirectory '%~dp0' -WindowStyle Hidden"
+powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -Command "Start-Process -FilePath '%TARGET_EXE%' -WorkingDirectory '%~dp0' -WindowStyle Hidden"
 exit /b 0
 "@ | Set-Content -Path (Join-Path $releaseDir "start_local_report.bat") -Encoding ASCII
 
@@ -64,7 +67,11 @@ cd /d "%~dp0"
 set "TARGET_EXE=%~dp0local_report_server.exe"
 if not exist "%TARGET_EXE%" exit /b 0
 
-powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "$target = [System.IO.Path]::GetFullPath('%TARGET_EXE%'); $items = @(Get-CimInstance Win32_Process -Filter 'name = ''local_report_server.exe''' -ErrorAction SilentlyContinue | Where-Object { $_.ExecutablePath -and [string]::Equals($_.ExecutablePath, $target, [System.StringComparison]::OrdinalIgnoreCase) }); if (-not $items) { exit 0 }; $items | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction Stop }; Start-Sleep -Milliseconds 800; $left = @(Get-CimInstance Win32_Process -Filter 'name = ''local_report_server.exe''' -ErrorAction SilentlyContinue | Where-Object { $_.ExecutablePath -and [string]::Equals($_.ExecutablePath, $target, [System.StringComparison]::OrdinalIgnoreCase) }); if ($left.Count -gt 0) { exit 1 }"
+powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "$target = [System.IO.Path]::GetFullPath('%TARGET_EXE%'); $items = @(Get-CimInstance Win32_Process -Filter 'name = ''local_report_server.exe''' -ErrorAction SilentlyContinue); if (-not $items) { exit 0 }; $same = @($items | Where-Object { $_.ExecutablePath -and [string]::Equals($_.ExecutablePath, $target, [System.StringComparison]::OrdinalIgnoreCase) }); if (-not $same) { $other = @($items | Where-Object { -not ($_.ExecutablePath -and [string]::Equals($_.ExecutablePath, $target, [System.StringComparison]::OrdinalIgnoreCase)) }); if ($other.Count -gt 0) { Write-Host '[WARN] running local_report_server.exe belongs to another directory:'; $other | ForEach-Object { if ($_.ExecutablePath) { Write-Host ('  ' + $_.ExecutablePath) } else { Write-Host '  <unknown path>' } }; exit 2 }; exit 0 }; $same | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction Stop }; Start-Sleep -Milliseconds 800; $left = @(Get-CimInstance Win32_Process -Filter 'name = ''local_report_server.exe''' -ErrorAction SilentlyContinue | Where-Object { $_.ExecutablePath -and [string]::Equals($_.ExecutablePath, $target, [System.StringComparison]::OrdinalIgnoreCase) }); if ($left.Count -gt 0) { exit 1 }"
+if %ERRORLEVEL%==2 (
+    echo [WARN] current directory has no matching running process; another directory version is running
+    exit /b 2
+)
 if errorlevel 1 (
     echo [ERROR] stop local_report_server failed
     exit /b 1

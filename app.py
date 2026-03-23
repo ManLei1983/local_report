@@ -229,6 +229,7 @@ completed_notice_sent: Dict[str, bool] = {}
 last_alert_sent_at: Dict[str, float] = {}
 alert_stale_started_at: Dict[str, float] = {}
 alert_sent_count: Dict[str, int] = {}
+recent_alert_dedupe: Dict[str, float] = {}
 
 db_lock = threading.Lock()
 db_conn: Optional[sqlite3.Connection] = None
@@ -1395,11 +1396,28 @@ def reconcile_supervision_snapshot(
     result_snapshot: Dict[str, Any],
     heartbeat_snapshot: Dict[str, Any],
 ) -> Dict[str, Any]:
+    result_code = str(result_snapshot.get("state_code", "") or "")
+    if result_code == "completed":
+        heartbeat_elapsed = heartbeat_snapshot.get("heartbeat_elapsed")
+        if heartbeat_snapshot.get("has_heartbeat") and heartbeat_elapsed is not None:
+            detail = (
+                f"{result_snapshot.get('detail', '')}；结果已完成，不再按 heartbeat 超时判定监督异常"
+            )
+        else:
+            detail = (
+                f"{result_snapshot.get('detail', '')}；结果已完成，不再按 game_tool 心跳缺失判定监督异常"
+            )
+        return {
+            **supervision_snapshot,
+            "state_code": "completed",
+            "state_label": "已完成",
+            "detail": detail,
+        }
+
     state_code = str(supervision_snapshot.get("state_code", "") or "")
     if state_code in ACTIVE_SUPERVISION_CODES:
         return supervision_snapshot
 
-    result_code = str(result_snapshot.get("state_code", "") or "")
     result_elapsed = result_snapshot.get("elapsed")
     if result_code != "fresh" or result_elapsed is None:
         return supervision_snapshot
@@ -3092,6 +3110,31 @@ def get_alert_cooldown_seconds(agent_id: str, now_ts: float) -> int:
     return settings.alert_cooldown_seconds
 
 
+def reserve_alert_dedupe(key: str, now_ts: float, window_seconds: int = 15) -> bool:
+    window = max(1, int(window_seconds))
+    cutoff_ts = now_ts - window
+    with state_lock:
+        expired_keys = [
+            item_key
+            for item_key, item_ts in recent_alert_dedupe.items()
+            if item_ts <= cutoff_ts
+        ]
+        for item_key in expired_keys:
+            recent_alert_dedupe.pop(item_key, None)
+
+        last_ts = float(recent_alert_dedupe.get(key, 0.0) or 0.0)
+        if last_ts > 0 and (now_ts - last_ts) < window:
+            return False
+
+        recent_alert_dedupe[key] = now_ts
+        return True
+
+
+def release_alert_dedupe(key: str) -> None:
+    with state_lock:
+        recent_alert_dedupe.pop(key, None)
+
+
 def should_alert_for_result_stale(
     result_stale: bool,
     supervision_code: str,
@@ -3181,7 +3224,20 @@ async def check_alerts_once() -> None:
 
                 row = latest_row
                 elapsed = latest_elapsed
-                ok = await post_wecom_markdown(build_timeout_markdown(row, elapsed))
+                timeout_content = build_timeout_markdown(row, elapsed)
+                timeout_dedupe_key = f"timeout:{timeout_content}"
+                if not reserve_alert_dedupe(timeout_dedupe_key, confirm_ts):
+                    logger.info(
+                        "duplicate timeout alert suppressed: agent=%s elapsed=%s",
+                        agent_id,
+                        elapsed,
+                    )
+                    stale_state[agent_id] = True
+                    continue
+
+                ok = await post_wecom_markdown(timeout_content)
+                if not ok:
+                    release_alert_dedupe(timeout_dedupe_key)
                 if ok:
                     last_alert_sent_at[agent_id] = confirm_ts
                     alert_sent_count[agent_id] = alert_sent_count.get(agent_id, 0) + 1
@@ -3244,6 +3300,9 @@ async def on_startup() -> None:
         settings.alert_enabled,
     )
     global alert_task
+    if alert_task and not alert_task.done():
+        logger.warning("startup skipped duplicate alert loop")
+        return
     alert_task = asyncio.create_task(alert_loop())
 
 

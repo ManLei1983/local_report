@@ -18,15 +18,16 @@
 ## 部署步骤
 1. 将整个发布目录复制到目标机器，例如 `D:\tools\local_report_server`。
 2. 按需复制 `.env.example` 为 `.env`，并填写实际配置。
-3. 确认目标机器防火墙允许 VM 访问 `18080` 端口。
-4. 执行 `start_local_report.bat`，后台启动 `local_report_server.exe`。
-5. 浏览器访问：
+3. 如果目标机器上已有旧版服务，先在旧目录执行 `stop_local_report.bat`，确认旧进程已停止；不要让不同目录下的 `local_report_server.exe` 并行运行。
+4. 确认目标机器防火墙允许 VM 访问 `18080` 端口。
+5. 执行 `start_local_report.bat`，后台启动 `local_report_server.exe`。
+6. 浏览器访问：
    - 首页：`http://目标IP:18080/`
    - 配置台：`http://目标IP:18080/console`
 
 ## 常用操作
 - 启动服务：`start_local_report.bat`
-- 停止服务：`stop_local_report.bat`
+- 停止服务：`stop_local_report.bat`（只能停止当前目录对应的 `local_report_server.exe`；如果后台跑的是旧目录版本，请去旧目录执行停止脚本，或按进程路径手动结束）
 - 前台调试：直接运行 `local_report_server.exe`
 
 ## game_tool 对接
