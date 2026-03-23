@@ -231,6 +231,11 @@ alert_stale_started_at: Dict[str, float] = {}
 alert_sent_count: Dict[str, int] = {}
 recent_alert_dedupe: Dict[str, float] = {}
 
+ASSIST_PENDING_STATE = "pending"
+ASSIST_ACTIVATED_STATE = "activated"
+ASSIST_FROZEN_STATE = "frozen"
+ASSIST_EFFECTIVE_STATES = {ASSIST_ACTIVATED_STATE, ASSIST_FROZEN_STATE}
+
 db_lock = threading.Lock()
 db_conn: Optional[sqlite3.Connection] = None
 alert_task: Optional[asyncio.Task] = None
@@ -371,12 +376,64 @@ def init_db() -> None:
             )
             """
         )
+        ensure_table_columns(
+            "agent_assist_overrides",
+            {
+                "assist_state": "TEXT NOT NULL DEFAULT 'pending'",
+                "helper_binding_active": "INTEGER NOT NULL DEFAULT 1",
+                "planned_effective_target_group_end": "INTEGER NOT NULL DEFAULT 0",
+                "activated_at": "TEXT DEFAULT ''",
+                "activation_group": "INTEGER NOT NULL DEFAULT 0",
+                "activation_role_index": "INTEGER NOT NULL DEFAULT 0",
+            },
+        )
+        db_conn.execute(
+            """
+            UPDATE agent_assist_overrides
+            SET assist_state = CASE
+                    WHEN planned_effective_target_group_end <= 0
+                         AND assist_state IN ('', 'pending') THEN 'activated'
+                    WHEN assist_state = '' THEN 'activated'
+                    ELSE assist_state
+                END,
+                helper_binding_active = CASE
+                    WHEN helper_binding_active NOT IN (0, 1) THEN 1
+                    ELSE helper_binding_active
+                END,
+                planned_effective_target_group_end = CASE
+                    WHEN planned_effective_target_group_end <= 0 THEN effective_target_group_end
+                    ELSE planned_effective_target_group_end
+                END,
+                activated_at = CASE
+                    WHEN activated_at = ''
+                         AND (
+                             planned_effective_target_group_end <= 0
+                             OR assist_state IN ('activated', 'frozen')
+                         ) THEN created_at
+                    ELSE activated_at
+                END
+            WHERE assist_state = ''
+               OR helper_binding_active NOT IN (0, 1)
+               OR planned_effective_target_group_end <= 0
+               OR (activated_at = '' AND assist_state IN ('activated', 'frozen'))
+            """
+        )
+        db_conn.execute(
+            """
+            UPDATE agent_assist_overrides
+            SET assist_state = 'activated'
+            WHERE assist_state = 'pending'
+              AND planned_effective_target_group_end = effective_target_group_end
+              AND activated_at != ''
+            """
+        )
         db_conn.execute("DROP INDEX IF EXISTS idx_assist_target_date")
         db_conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_assist_target_date ON agent_assist_overrides(work_date, target_agent_id)"
         )
+        db_conn.execute("DROP INDEX IF EXISTS idx_assist_helper_date")
         db_conn.execute(
-            "CREATE UNIQUE INDEX IF NOT EXISTS idx_assist_helper_date ON agent_assist_overrides(work_date, helper_agent_id)"
+            "CREATE INDEX IF NOT EXISTS idx_assist_helper_date ON agent_assist_overrides(work_date, helper_agent_id)"
         )
         db_conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_assist_work_date ON agent_assist_overrides(work_date)"
@@ -1422,11 +1479,6 @@ def reconcile_supervision_snapshot(
     if result_code != "fresh" or result_elapsed is None:
         return supervision_snapshot
 
-    thresholds = get_supervision_thresholds(agent_profile)
-    active_window_seconds = max(30, thresholds["heartbeat_missing_seconds"])
-    if int(max(0, result_elapsed)) > active_window_seconds:
-        return supervision_snapshot
-
     heartbeat_elapsed = heartbeat_snapshot.get("heartbeat_elapsed")
     if heartbeat_snapshot.get("has_heartbeat") and heartbeat_elapsed is not None:
         detail = (
@@ -2030,15 +2082,24 @@ def row_to_assist_override(row: sqlite3.Row) -> Dict[str, Any]:
         "effective_target_group_end": parse_int(
             row["effective_target_group_end"], 0
         ),
+        "planned_effective_target_group_end": parse_int(
+            row["planned_effective_target_group_end"],
+            parse_int(row["effective_target_group_end"], 0),
+        ),
+        "assist_state": str(row["assist_state"] or ASSIST_PENDING_STATE),
+        "helper_binding_active": bool(parse_int(row["helper_binding_active"], 0)),
+        "activated_at": row["activated_at"] or "",
+        "activation_group": parse_int(row["activation_group"], 0),
+        "activation_role_index": parse_int(row["activation_role_index"], 0),
         "created_at": row["created_at"],
         "updated_at": row["updated_at"],
     }
 
 
-
-def list_active_assists_for_target(
+def list_assists_for_target(
     agent_id: str,
     work_date: Optional[str] = None,
+    states: Optional[set[str]] = None,
 ) -> List[Dict[str, Any]]:
     if not db_conn or not agent_id:
         return []
@@ -2049,14 +2110,29 @@ def list_active_assists_for_target(
             SELECT id, work_date, target_agent_id, helper_agent_id, region,
                    delegate_start, delegate_end,
                    original_target_group_end, effective_target_group_end,
+                   planned_effective_target_group_end,
+                   assist_state, helper_binding_active,
+                   activated_at, activation_group, activation_role_index,
                    created_at, updated_at
             FROM agent_assist_overrides
             WHERE work_date = ? AND target_agent_id = ?
-            ORDER BY delegate_start ASC, delegate_end ASC, helper_agent_id ASC
+            ORDER BY delegate_start ASC, delegate_end ASC, helper_agent_id ASC, id ASC
             """,
             (effective_date, agent_id),
         ).fetchall()
-    return [row_to_assist_override(row) for row in rows]
+    items = [row_to_assist_override(row) for row in rows]
+    if states is not None:
+        items = [
+            item for item in items if str(item.get("assist_state", "") or "") in states
+        ]
+    return items
+
+
+def list_active_assists_for_target(
+    agent_id: str,
+    work_date: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    return list_assists_for_target(agent_id, work_date=work_date)
 
 
 def validate_target_assist_segments(
@@ -2131,18 +2207,32 @@ def sync_target_assist_effective_group_end(
     if not assist_rows:
         return []
     effective_date = str(work_date or today_str())
+    target_group_end = max(
+        0,
+        max(parse_int(item.get("original_target_group_end"), 0) for item in assist_rows),
+    )
+    effective_rows = [
+        item
+        for item in assist_rows
+        if str(item.get("assist_state", "") or "") in ASSIST_EFFECTIVE_STATES
+    ]
     effective_group_end = compute_target_assist_effective_group_end(
-        max(0, parse_int(assist_rows[-1].get("original_target_group_end"), 0)),
+        target_group_end,
+        effective_rows,
+    )
+    planned_group_end = compute_target_assist_effective_group_end(
+        target_group_end,
         assist_rows,
     )
     with db_lock:
         with db_conn:
             db_conn.execute(
-                "UPDATE agent_assist_overrides SET effective_target_group_end = ? WHERE work_date = ? AND target_agent_id = ?",
-                (effective_group_end, effective_date, target_agent_id),
+                "UPDATE agent_assist_overrides SET effective_target_group_end = ?, planned_effective_target_group_end = ? WHERE work_date = ? AND target_agent_id = ?",
+                (effective_group_end, planned_group_end, effective_date, target_agent_id),
             )
     for row in assist_rows:
         row["effective_target_group_end"] = effective_group_end
+        row["planned_effective_target_group_end"] = planned_group_end
     return assist_rows
 
 
@@ -2153,8 +2243,26 @@ def build_target_assist_view(assist_rows: List[Dict[str, Any]]) -> Dict[str, Any
         assist_rows,
         key=lambda item: max(0, parse_int(item.get("delegate_start"), 0)),
     )
+    target_group_end = max(
+        0,
+        max(parse_int(item.get("original_target_group_end"), 0) for item in sorted_rows),
+    )
+    effective_rows = [
+        item
+        for item in sorted_rows
+        if str(item.get("assist_state", "") or "") in ASSIST_EFFECTIVE_STATES
+    ]
+    pending_rows = [
+        item
+        for item in sorted_rows
+        if str(item.get("assist_state", "") or "") == ASSIST_PENDING_STATE
+    ]
     effective_group_end = compute_target_assist_effective_group_end(
-        max(0, parse_int(sorted_rows[-1].get("original_target_group_end"), 0)),
+        target_group_end,
+        effective_rows,
+    )
+    planned_group_end = compute_target_assist_effective_group_end(
+        target_group_end,
         sorted_rows,
     )
     helper_ids = [str(row.get("helper_agent_id", "") or "") for row in sorted_rows]
@@ -2162,20 +2270,47 @@ def build_target_assist_view(assist_rows: List[Dict[str, Any]]) -> Dict[str, Any
         f"{parse_int(row.get('delegate_start'), 0)}->{parse_int(row.get('delegate_end'), 0)}"
         for row in sorted_rows
     )
-    if len(sorted_rows) == 1:
-        row = dict(sorted_rows[0])
-        row["effective_target_group_end"] = effective_group_end
-        return build_assist_view(row, role="target")
+    effective_segments_text = ", ".join(
+        f"{parse_int(row.get('delegate_start'), 0)}->{parse_int(row.get('delegate_end'), 0)}"
+        for row in effective_rows
+    )
+    pending_segments_text = ", ".join(
+        f"{parse_int(row.get('delegate_start'), 0)}->{parse_int(row.get('delegate_end'), 0)}"
+        for row in pending_rows
+    )
+    if not effective_rows and pending_rows:
+        summary = (
+            f"已分配 {', '.join(helper_ids)} 接手 {segment_text}，待 helper 首次结果上报后生效；"
+            f"当前仍按结束组 {effective_group_end}，生效后为 {planned_group_end}"
+        )
+        state = ASSIST_PENDING_STATE
+    elif effective_rows and pending_rows:
+        summary = (
+            f"已由 {', '.join(str(row.get('helper_agent_id', '') or '') for row in effective_rows)} 接手 {effective_segments_text}，"
+            f"当前有效结束组 {effective_group_end}；待 {', '.join(str(row.get('helper_agent_id', '') or '') for row in pending_rows)} "
+            f"首次结果上报后接手 {pending_segments_text}，生效后为 {planned_group_end}"
+        )
+        state = ASSIST_ACTIVATED_STATE
+    else:
+        summary = f"由 {', '.join(helper_ids)} 接手 {segment_text}，当前有效结束组 {effective_group_end}"
+        state = ASSIST_FROZEN_STATE if sorted_rows and all(
+            str(row.get("assist_state", "") or "") == ASSIST_FROZEN_STATE
+            for row in sorted_rows
+        ) else ASSIST_ACTIVATED_STATE
     return {
         **sorted_rows[0],
         "active": True,
         "role": "target",
+        "assist_state": state,
         "helper_agent_ids": helper_ids,
         "helper_count": len(helper_ids),
         "delegate_start": parse_int(sorted_rows[0].get("delegate_start"), 0),
         "delegate_end": parse_int(sorted_rows[-1].get("delegate_end"), 0),
         "effective_target_group_end": effective_group_end,
-        "summary": f"\u7531 {', '.join(helper_ids)} \u63a5\u624b {segment_text}\uff0c\u4eca\u65e5\u6709\u6548\u7ed3\u675f\u7ec4 {effective_group_end}",
+        "planned_effective_target_group_end": planned_group_end,
+        "pending_count": len(pending_rows),
+        "activated_count": len(effective_rows),
+        "summary": summary,
     }
 
 
@@ -2306,9 +2441,13 @@ def get_active_assist_for_helper(
             SELECT id, work_date, target_agent_id, helper_agent_id, region,
                    delegate_start, delegate_end,
                    original_target_group_end, effective_target_group_end,
+                   planned_effective_target_group_end,
+                   assist_state, helper_binding_active,
+                   activated_at, activation_group, activation_role_index,
                    created_at, updated_at
             FROM agent_assist_overrides
-            WHERE work_date = ? AND helper_agent_id = ?
+            WHERE work_date = ? AND helper_agent_id = ? AND helper_binding_active = 1
+            ORDER BY id DESC
             """,
             (effective_date, agent_id),
         ).fetchone()
@@ -2327,10 +2466,13 @@ def list_active_assist_overrides(
             SELECT id, work_date, target_agent_id, helper_agent_id, region,
                    delegate_start, delegate_end,
                    original_target_group_end, effective_target_group_end,
+                   planned_effective_target_group_end,
+                   assist_state, helper_binding_active,
+                   activated_at, activation_group, activation_role_index,
                    created_at, updated_at
             FROM agent_assist_overrides
             WHERE work_date = ?
-            ORDER BY target_agent_id ASC, delegate_start ASC, helper_agent_id ASC
+            ORDER BY target_agent_id ASC, delegate_start ASC, helper_agent_id ASC, id ASC
             """,
             (effective_date,),
         ).fetchall()
@@ -2360,17 +2502,39 @@ def build_assist_view(
     effective_group_end = parse_int(
         assist_row.get("effective_target_group_end"), 0
     )
+    planned_group_end = parse_int(
+        assist_row.get("planned_effective_target_group_end"),
+        effective_group_end,
+    )
+    assist_state = str(assist_row.get("assist_state", "") or ASSIST_PENDING_STATE)
     region = str(assist_row.get("region", "") or "")
     if role == "helper":
-        summary = (
-            f"\u534f\u52a9 {target_agent_id} \u5c3e\u6bb5 {delegate_start}->{delegate_end}"
-            + (f" / \u533a\u670d {region}" if region else "")
-        )
+        summary = f"\u534f\u52a9 {target_agent_id} \u5c3e\u6bb5 {delegate_start}->{delegate_end}"
+        if region:
+            summary += f" / \u533a\u670d {region}"
+        if assist_state == ASSIST_PENDING_STATE:
+            summary += " / \u5f85\u9996\u6b21\u7ed3\u679c\u6fc0\u6d3b"
+        elif assist_state == ASSIST_ACTIVATED_STATE:
+            summary += " / \u5df2\u6fc0\u6d3b"
+        elif assist_state == ASSIST_FROZEN_STATE:
+            summary += " / \u5df2\u51bb\u7ed3\u751f\u6548"
     elif role == "target":
-        summary = (
-            f"\u7531 {helper_agent_id} \u63a5\u624b {delegate_start}->{delegate_end}"
-            f"\uff0c\u4eca\u65e5\u6709\u6548\u7ed3\u675f\u7ec4 {effective_group_end}"
-        )
+        if assist_state == ASSIST_PENDING_STATE:
+            summary = (
+                f"\u5df2\u5206\u914d {helper_agent_id} \u63a5\u624b {delegate_start}->{delegate_end}"
+                f"\uff0c\u5f85 helper \u9996\u6b21\u7ed3\u679c\u4e0a\u62a5\u540e\u751f\u6548\uff1b"
+                f"\u5f53\u524d\u4ecd\u6309\u7ed3\u675f\u7ec4 {effective_group_end}\uff0c\u751f\u6548\u540e\u4e3a {planned_group_end}"
+            )
+        elif assist_state == ASSIST_FROZEN_STATE:
+            summary = (
+                f"\u7531 {helper_agent_id} \u63a5\u624b {delegate_start}->{delegate_end}"
+                f"\uff08\u5df2\u51bb\u7ed3\uff09\uff0c\u5f53\u524d\u6709\u6548\u7ed3\u675f\u7ec4 {effective_group_end}"
+            )
+        else:
+            summary = (
+                f"\u7531 {helper_agent_id} \u63a5\u624b {delegate_start}->{delegate_end}"
+                f"\uff0c\u5f53\u524d\u6709\u6548\u7ed3\u675f\u7ec4 {effective_group_end}"
+            )
     else:
         summary = (
             f"{helper_agent_id} -> {target_agent_id}"
@@ -2452,6 +2616,86 @@ def get_latest_agent_progress(agent_id: str) -> Dict[str, Any]:
     }
 
 
+def maybe_activate_assist_from_report(
+    agent_id: str,
+    report: Dict[str, Any],
+) -> Optional[Dict[str, Any]]:
+    helper_assist = get_active_assist_for_helper(agent_id)
+    if not helper_assist:
+        return None
+    if str(helper_assist.get("assist_state", "") or "") != ASSIST_PENDING_STATE:
+        return None
+
+    report_group = max(
+        parse_int(report.get("current_group"), 0),
+        parse_int(report.get("finished_group"), 0),
+    )
+    if report_group < max(0, parse_int(helper_assist.get("delegate_start"), 0)):
+        return None
+
+    assigned_region = str(helper_assist.get("region", "") or "").strip()
+    report_region = str(report.get("region", "") or "").strip()
+    assigned_region_number = extract_region_number(assigned_region)
+    report_region_number = extract_region_number(report_region)
+    if assigned_region and report_region:
+        if assigned_region_number is not None and report_region_number is not None:
+            if assigned_region_number != report_region_number:
+                return None
+        elif assigned_region != report_region:
+            return None
+
+    if not db_conn:
+        return None
+
+    current_time = now_str()
+    activation_role_index = max(0, parse_int(report.get("role_index"), 0))
+    with db_lock:
+        with db_conn:
+            cur = db_conn.execute(
+                """
+                UPDATE agent_assist_overrides
+                SET assist_state = ?,
+                    activated_at = ?,
+                    activation_group = ?,
+                    activation_role_index = ?,
+                    updated_at = ?
+                WHERE id = ? AND assist_state = ?
+                """,
+                (
+                    ASSIST_ACTIVATED_STATE,
+                    current_time,
+                    report_group,
+                    activation_role_index,
+                    current_time,
+                    helper_assist["id"],
+                    ASSIST_PENDING_STATE,
+                ),
+            )
+            if cur.rowcount <= 0:
+                return None
+            row = db_conn.execute(
+                """
+                SELECT id, work_date, target_agent_id, helper_agent_id, region,
+                       delegate_start, delegate_end,
+                       original_target_group_end, effective_target_group_end,
+                       planned_effective_target_group_end,
+                       assist_state, helper_binding_active,
+                       activated_at, activation_group, activation_role_index,
+                       created_at, updated_at
+                FROM agent_assist_overrides
+                WHERE id = ?
+                """,
+                (helper_assist["id"],),
+            ).fetchone()
+    activated_row = row_to_assist_override(row) if row else None
+    if activated_row:
+        sync_target_assist_effective_group_end(
+            str(activated_row.get("target_agent_id", "") or ""),
+            work_date=str(activated_row.get("work_date", "") or today_str()),
+        )
+    return activated_row
+
+
 def validate_assist_region(target_region: str, requested_region: str) -> str:
     target_text = str(target_region or "").strip()
     requested_text = str(requested_region or "").strip()
@@ -2507,10 +2751,6 @@ def upsert_assist_override(payload: AssistAssignPayload) -> Dict[str, Any]:
         )
 
     helper_active = get_active_assist_for_helper(helper_agent_id)
-    if helper_active and helper_active.get("target_agent_id") != target_agent_id:
-        raise ValueError(
-            f"\u534f\u52a9 Agent {helper_agent_id} \u4eca\u5929\u5df2\u7ecf\u5728\u534f\u52a9 {helper_active.get('target_agent_id')}"
-        )
 
     latest_progress = get_latest_agent_progress(target_agent_id)
     if parse_int(latest_progress.get("group"), 0) >= delegate_start:
@@ -2535,7 +2775,7 @@ def upsert_assist_override(payload: AssistAssignPayload) -> Dict[str, Any]:
         target_group_end,
         existing_target_assists + [proposed_assist],
     )
-    effective_group_end = compute_target_assist_effective_group_end(
+    planned_effective_group_end = compute_target_assist_effective_group_end(
         target_group_end,
         combined_target_assists,
     )
@@ -2547,20 +2787,61 @@ def upsert_assist_override(payload: AssistAssignPayload) -> Dict[str, Any]:
     current_time = now_str()
     work_date = today_str()
 
+    if helper_active:
+        same_target = str(helper_active.get("target_agent_id", "") or "") == target_agent_id
+        same_segment = (
+            parse_int(helper_active.get("delegate_start"), 0) == delegate_start
+            and parse_int(helper_active.get("delegate_end"), 0) == delegate_end
+            and str(helper_active.get("region", "") or "") == region
+        )
+        current_state = str(helper_active.get("assist_state", "") or ASSIST_PENDING_STATE)
+        if same_target and same_segment:
+            sync_target_assist_effective_group_end(target_agent_id, work_date=work_date)
+            return helper_active
+        if same_target and current_state in ASSIST_EFFECTIVE_STATES:
+            raise ValueError(
+                f"\u534f\u52a9 Agent {helper_agent_id} \u7684\u534f\u52a9\u5df2\u751f\u6548\uff0c\u4e0d\u652f\u6301\u76f4\u63a5\u6539\u5206\u7247\uff1b\u8bf7\u91cd\u65b0\u6307\u6d3e\u6216\u6e05\u7406\u540e\u518d\u4e0b\u53d1"
+            )
+
+    affected_targets: set[str] = set()
+
     with db_lock:
         with db_conn:
-            db_conn.execute(
-                "DELETE FROM agent_assist_overrides WHERE work_date = ? AND helper_agent_id = ?",
-                (work_date, helper_agent_id),
-            )
+            if helper_active:
+                old_target_agent_id = str(helper_active.get("target_agent_id", "") or "")
+                old_state = str(helper_active.get("assist_state", "") or ASSIST_PENDING_STATE)
+                if old_state == ASSIST_PENDING_STATE:
+                    db_conn.execute(
+                        "DELETE FROM agent_assist_overrides WHERE id = ?",
+                        (helper_active["id"],),
+                    )
+                else:
+                    db_conn.execute(
+                        """
+                        UPDATE agent_assist_overrides
+                        SET assist_state = ?, helper_binding_active = 0, updated_at = ?
+                        WHERE id = ?
+                        """,
+                        (
+                            ASSIST_FROZEN_STATE,
+                            current_time,
+                            helper_active["id"],
+                        ),
+                    )
+                if old_target_agent_id:
+                    affected_targets.add(old_target_agent_id)
+
             db_conn.execute(
                 """
                 INSERT INTO agent_assist_overrides (
                     work_date, target_agent_id, helper_agent_id, region,
                     delegate_start, delegate_end,
                     original_target_group_end, effective_target_group_end,
+                    planned_effective_target_group_end,
+                    assist_state, helper_binding_active,
+                    activated_at, activation_group, activation_role_index,
                     created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     work_date,
@@ -2570,26 +2851,35 @@ def upsert_assist_override(payload: AssistAssignPayload) -> Dict[str, Any]:
                     delegate_start,
                     delegate_end,
                     target_group_end,
-                    effective_group_end,
+                    target_group_end,
+                    planned_effective_group_end,
+                    ASSIST_PENDING_STATE,
+                    1,
+                    "",
+                    0,
+                    0,
                     current_time,
                     current_time,
                 ),
-            )
-            db_conn.execute(
-                "UPDATE agent_assist_overrides SET effective_target_group_end = ? WHERE work_date = ? AND target_agent_id = ?",
-                (effective_group_end, work_date, target_agent_id),
             )
             row = db_conn.execute(
                 """
                 SELECT id, work_date, target_agent_id, helper_agent_id, region,
                        delegate_start, delegate_end,
                        original_target_group_end, effective_target_group_end,
+                       planned_effective_target_group_end,
+                       assist_state, helper_binding_active,
+                       activated_at, activation_group, activation_role_index,
                        created_at, updated_at
                 FROM agent_assist_overrides
-                WHERE work_date = ? AND helper_agent_id = ?
+                WHERE work_date = ? AND helper_agent_id = ? AND helper_binding_active = 1
+                ORDER BY id DESC
                 """,
                 (work_date, helper_agent_id),
             ).fetchone()
+    affected_targets.add(target_agent_id)
+    for affected_target_id in affected_targets:
+        sync_target_assist_effective_group_end(affected_target_id, work_date=work_date)
     return row_to_assist_override(row)
 
 
@@ -2613,16 +2903,41 @@ def clear_assist_override(
     if target_agent_id:
         clauses.append("target_agent_id = ?")
         params.append(target_agent_id)
-    sql = "DELETE FROM agent_assist_overrides WHERE " + " AND ".join(clauses)
+    current_time = now_str()
     with db_lock:
         rows = db_conn.execute(
-            "SELECT DISTINCT target_agent_id FROM agent_assist_overrides WHERE " + " AND ".join(clauses),
+            """
+            SELECT id, target_agent_id, assist_state, helper_binding_active
+            FROM agent_assist_overrides
+            WHERE """
+            + " AND ".join(clauses),
             tuple(params),
         ).fetchall()
         with db_conn:
-            cur = db_conn.execute(sql, tuple(params))
-            deleted_count = cur.rowcount
-    affected_targets = [str(row["target_agent_id"] or "") for row in rows if row["target_agent_id"]]
+            deleted_count = 0
+            for row in rows:
+                assist_state = str(row["assist_state"] or ASSIST_PENDING_STATE)
+                binding_active = bool(parse_int(row["helper_binding_active"], 0))
+                if assist_state == ASSIST_PENDING_STATE:
+                    cur = db_conn.execute(
+                        "DELETE FROM agent_assist_overrides WHERE id = ?",
+                        (row["id"],),
+                    )
+                    deleted_count += max(0, cur.rowcount)
+                    continue
+                if binding_active:
+                    cur = db_conn.execute(
+                        """
+                        UPDATE agent_assist_overrides
+                        SET assist_state = ?, helper_binding_active = 0, updated_at = ?
+                        WHERE id = ?
+                        """,
+                        (ASSIST_FROZEN_STATE, current_time, row["id"]),
+                    )
+                    deleted_count += max(0, cur.rowcount)
+    affected_targets = [
+        str(row["target_agent_id"] or "") for row in rows if row["target_agent_id"]
+    ]
     for target_id in affected_targets:
         sync_target_assist_effective_group_end(target_id, work_date=effective_date)
     return deleted_count
@@ -3494,7 +3809,7 @@ async def console_assist_clear(
     target_agent_id = str(form.get("target_agent_id", "")).strip()
     if not helper_agent_id and not target_agent_id:
         return RedirectResponse(
-            build_console_redirect_url(auth_token, "缺少 helper_agent_id 或 target_agent_id"),
+            build_console_redirect_url(auth_token, "\u7f3a\u5c11 helper_agent_id \u6216 target_agent_id"),
             status_code=303,
         )
 
@@ -3503,9 +3818,9 @@ async def console_assist_clear(
         target_agent_id=target_agent_id,
     )
     if removed > 0:
-        message = "协助任务已清除"
+        message = "\u534f\u52a9\u4efb\u52a1\u5df2\u5904\u7406\uff08\u5f85\u751f\u6548\u5220\u9664\uff0c\u5df2\u751f\u6548\u51bb\u7ed3\u4fdd\u7559\uff09"
     else:
-        message = "未找到可清除的协助任务"
+        message = "\u672a\u627e\u5230\u53ef\u5904\u7406\u7684\u534f\u52a9\u4efb\u52a1"
     return RedirectResponse(
         build_console_redirect_url(auth_token, message),
         status_code=303,
@@ -3851,6 +4166,14 @@ async def api_agent_control(
     with state_lock:
         heartbeat_item = dict(heartbeat_states.get(agent_profile["agent_id"], {}))
         report_item = dict(agent_states.get(agent_profile["agent_id"], {}))
+    result_snapshot = build_result_snapshot(agent_profile, report_item)
+    heartbeat_snapshot = build_heartbeat_snapshot(heartbeat_item)
+    supervision_snapshot = reconcile_supervision_snapshot(
+        agent_profile,
+        build_supervision_snapshot(agent_profile, heartbeat_item),
+        result_snapshot,
+        heartbeat_snapshot,
+    )
 
     return {
         "ok": True,
@@ -3872,9 +4195,9 @@ async def api_agent_control(
         "assist": task_context["assist"],
         "control": build_agent_control(agent_profile),
         "runtime": build_agent_runtime_snapshot(agent_profile["agent_id"]),
-        "heartbeat": build_heartbeat_snapshot(heartbeat_item),
-        "supervision": build_supervision_snapshot(agent_profile, heartbeat_item),
-        "result": build_result_snapshot(agent_profile, report_item),
+        "heartbeat": heartbeat_snapshot,
+        "supervision": supervision_snapshot,
+        "result": result_snapshot,
         "updated_at": agent_profile["updated_at"],
     }
 
@@ -3961,16 +4284,24 @@ async def api_agent_heartbeat(
         heartbeat_states[payload.agent_id] = heartbeat
         report_item = dict(agent_states.get(payload.agent_id, {}))
     agent_profile = get_agent_profile(payload.agent_id)
-    return {
-        "ok": True,
-        "server_time": server_time,
-        "heartbeat": build_heartbeat_snapshot(heartbeat, now_ts=server_epoch),
-        "supervision": build_supervision_snapshot(
+    result_snapshot = build_result_snapshot(agent_profile, report_item, now_ts=server_epoch)
+    heartbeat_snapshot = build_heartbeat_snapshot(heartbeat, now_ts=server_epoch)
+    supervision_snapshot = reconcile_supervision_snapshot(
+        agent_profile,
+        build_supervision_snapshot(
             agent_profile,
             heartbeat,
             now_ts=server_epoch,
         ),
-        "result": build_result_snapshot(agent_profile, report_item, now_ts=server_epoch),
+        result_snapshot,
+        heartbeat_snapshot,
+    )
+    return {
+        "ok": True,
+        "server_time": server_time,
+        "heartbeat": heartbeat_snapshot,
+        "supervision": supervision_snapshot,
+        "result": result_snapshot,
     }
 
 
@@ -4040,6 +4371,16 @@ async def api_report(
         )
 
     save_report_to_db(report)
+    activated_assist = maybe_activate_assist_from_report(payload.agent_id, report)
+    if activated_assist:
+        logger.info(
+            "assist activated by first result: helper=%s target=%s segment=%s->%s group=%s",
+            payload.agent_id,
+            activated_assist.get("target_agent_id", ""),
+            activated_assist.get("delegate_start", 0),
+            activated_assist.get("delegate_end", 0),
+            activated_assist.get("activation_group", 0),
+        )
     await maybe_send_completed_notice(payload.agent_id, report)
     logger.info(
         "report received: agent=%s region=%s group=%s role=%s",

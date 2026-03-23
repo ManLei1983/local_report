@@ -121,9 +121,11 @@ tr.active td{background:#f5f9ff}
               <tr>
                 <th>Helper</th>
                 <th>Target</th>
-                <th>区服</th>
-                <th>接手范围</th>
-                <th>目标今日有效结束组</th>
+                <th>&#x533a;&#x670d;</th>
+                <th>&#x63a5;&#x624b;&#x8303;&#x56f4;</th>
+                <th>&#x72b6;&#x6001;</th>
+                <th>&#x76ee;&#x6807;&#x5f53;&#x524d;&#x7ed3;&#x675f;&#x7ec4;</th>
+                <th>&#x76ee;&#x6807;&#x8ba1;&#x5212;&#x7ed3;&#x675f;&#x7ec4;</th>
                 <th></th>
               </tr>
             </thead>
@@ -140,24 +142,34 @@ tr.active td{background:#f5f9ff}
                 </td>
                 <td>{{ assist.region or '-' }}</td>
                 <td>{{ assist.delegate_start }} -> {{ assist.delegate_end }}</td>
+                <td>
+                  {% if assist.assist_state == 'pending' %}
+                    &#x5f85;&#x751f;&#x6548;
+                  {% elif assist.assist_state == 'frozen' %}
+                    &#x5df2;&#x51bb;&#x7ed3;
+                  {% else %}
+                    &#x5df2;&#x751f;&#x6548;
+                  {% endif %}
+                </td>
                 <td>{{ assist.effective_target_group_end }}</td>
+                <td>{{ assist.planned_effective_target_group_end }}</td>
                 <td>
                   <div class="inline-actions">
                     <form method="get" action="/console">
                       <input type="hidden" name="auth_token" value="{{ auth_token }}">
                       <input type="hidden" name="edit_assist_helper" value="{{ assist.helper_agent_id }}">
-                      <button class="btn" type="submit">编辑</button>
+                      <button class="btn" type="submit">&#x7f16;&#x8f91;</button>
                     </form>
-                    <form method="post" action="/console/assist/clear{{ auth_query_suffix }}" onsubmit="return confirm('确认清除这条临时协助任务吗？');">
+                    <form method="post" action="/console/assist/clear{{ auth_query_suffix }}" onsubmit="return confirm('&#x786e;&#x8ba4;&#x5904;&#x7406;&#x8fd9;&#x6761;&#x4e34;&#x65f6;&#x534f;&#x52a9;&#x4efb;&#x52a1;&#x5417;&#xff1f;&#x5f85;&#x751f;&#x6548;&#x8bb0;&#x5f55;&#x4f1a;&#x5220;&#x9664;&#xff0c;&#x5df2;&#x751f;&#x6548;&#x8bb0;&#x5f55;&#x4f1a;&#x51bb;&#x7ed3;&#x4fdd;&#x7559;&#x3002;');">
                       <input type="hidden" name="helper_agent_id" value="{{ assist.helper_agent_id }}">
                       <input type="hidden" name="target_agent_id" value="{{ assist.target_agent_id }}">
-                      <button class="btn danger" type="submit">清除</button>
+                      <button class="btn danger" type="submit">&#x6e05;&#x9664;</button>
                     </form>
                   </div>
                 </td>
               </tr>
             {% else %}
-              <tr><td colspan="6">今天还没有临时协助任务。</td></tr>
+              <tr><td colspan="8">&#x4eca;&#x5929;&#x8fd8;&#x6ca1;&#x6709;&#x4e34;&#x65f6;&#x534f;&#x52a9;&#x4efb;&#x52a1;&#x3002;</td></tr>
             {% endfor %}
             </tbody>
           </table>
@@ -165,8 +177,8 @@ tr.active td{background:#f5f9ff}
       </div>
 
       <div class="subtle">
-        <h3 style="margin:0 0 8px">{{ selected_assist and '编辑临时协助任务' or '新建临时协助任务' }}</h3>
-        <div class="hint" style="margin-bottom:12px">支持多台 helper 连续接手同一目标 Agent 的尾段任务。规则很简单：所有分片必须首尾相接、不能重叠、最后一段必须覆盖到目标 Agent 的原始 `group_end`。例如先分配 `91 -> 104`，再新增一台时就必须补成 `81 -> 90` 这类连续区间。</div>
+        <h3 style="margin:0 0 8px">{{ selected_assist and '&#x7f16;&#x8f91;&#x4e34;&#x65f6;&#x534f;&#x52a9;&#x4efb;&#x52a1;' or '&#x65b0;&#x5efa;&#x4e34;&#x65f6;&#x534f;&#x52a9;&#x4efb;&#x52a1;' }}</h3>
+        <div class="hint" style="margin-bottom:12px">&#x652f;&#x6301;&#x591a;&#x53f0; helper &#x8fde;&#x7eed;&#x63a5;&#x624b;&#x540c;&#x4e00;&#x76ee;&#x6807; Agent &#x7684;&#x5c3e;&#x6bb5;&#x4efb;&#x52a1;&#x3002;&#x89c4;&#x5219;&#x5f88;&#x7b80;&#x5355;&#xff1a;&#x6240;&#x6709;&#x5206;&#x7247;&#x5fc5;&#x987b;&#x9996;&#x5c3e;&#x76f8;&#x63a5;&#x3001;&#x4e0d;&#x80fd;&#x91cd;&#x53e0;&#x3001;&#x6700;&#x540e;&#x4e00;&#x6bb5;&#x5fc5;&#x987b;&#x8986;&#x76d6;&#x5230;&#x76ee;&#x6807; Agent &#x7684;&#x539f;&#x59cb; `group_end`&#x3002;&#x4f8b;&#x5982;&#x5148;&#x5206;&#x914d; `91 -> 104`&#xff0c;&#x518d;&#x65b0;&#x589e;&#x4e00;&#x53f0;&#x65f6;&#x5c31;&#x5fc5;&#x987b;&#x8865;&#x6210; `81 -> 90` &#x8fd9;&#x7c7b;&#x8fde;&#x7eed;&#x533a;&#x95f4;&#x3002;&#x72b6;&#x6001;&#x8bf4;&#x660e;&#xff1a;&#x5f85;&#x751f;&#x6548; = helper &#x9996;&#x6b21;&#x7ed3;&#x679c;&#x4e0a;&#x62a5;&#x540e;&#x624d;&#x771f;&#x6b63;&#x622a;&#x65ad;&#xff1b;&#x5df2;&#x51bb;&#x7ed3; = &#x5386;&#x53f2;&#x5df2;&#x751f;&#x6548;&#x8bb0;&#x5f55;&#xff0c;&#x540e;&#x7eed;&#x6539;&#x6d3e;&#x4e5f;&#x4e0d;&#x4f1a;&#x8ba9;&#x65e7; target &#x56de;&#x5f39;&#x3002;</div>
         <form method="post" action="/console/assist/save{{ auth_query_suffix }}">
           <div class="fields">
             <div class="two">
