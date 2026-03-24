@@ -226,6 +226,7 @@ history_cache: deque = deque(maxlen=2000)
 stale_state: Dict[str, bool] = {}
 completed_state: Dict[str, bool] = {}
 completed_notice_sent: Dict[str, bool] = {}
+completed_latches: Dict[str, Dict[str, Any]] = {}
 last_alert_sent_at: Dict[str, float] = {}
 alert_stale_started_at: Dict[str, float] = {}
 alert_sent_count: Dict[str, int] = {}
@@ -235,6 +236,7 @@ ASSIST_PENDING_STATE = "pending"
 ASSIST_ACTIVATED_STATE = "activated"
 ASSIST_FROZEN_STATE = "frozen"
 ASSIST_EFFECTIVE_STATES = {ASSIST_ACTIVATED_STATE, ASSIST_FROZEN_STATE}
+COMPLETION_LATCH_RELEASE_INTENTS = {"start_requested", "restart_requested"}
 
 db_lock = threading.Lock()
 db_conn: Optional[sqlite3.Connection] = None
@@ -860,13 +862,206 @@ def get_agent_complete_role_index(agent_profile: Optional[Dict[str, Any]]) -> in
     return DEFAULT_COMPLETE_ROLE_INDEX
 
 
+def build_report_progress_signature(item: Optional[Dict[str, Any]]) -> str:
+    report = item or {}
+    payload = {
+        "event": str(report.get("event", "") or ""),
+        "region": str(report.get("region", "") or ""),
+        "current_group": max(0, parse_int(report.get("current_group"), 0)),
+        "finished_group": max(0, parse_int(report.get("finished_group"), 0)),
+        "next_group": max(0, parse_int(report.get("next_group"), 0)),
+        "role_index": max(0, parse_int(report.get("role_index"), 0)),
+    }
+    return json.dumps(payload, ensure_ascii=False, sort_keys=True)
+
+
+def build_completion_task_fingerprint(
+    agent_profile: Optional[Dict[str, Any]],
+) -> str:
+    task_context = build_agent_task_context(agent_profile)
+    assist = (
+        task_context.get("assist", {})
+        if isinstance(task_context.get("assist", {}), dict)
+        else {}
+    )
+    helper_agent_ids = assist.get("helper_agent_ids", [])
+    if not isinstance(helper_agent_ids, list):
+        helper_agent_ids = []
+    payload = {
+        "region": str(task_context.get("region", "") or ""),
+        "group_start": max(0, parse_int(task_context.get("group_start"), 0)),
+        "group_end": max(0, parse_int(task_context.get("group_end"), 0)),
+        "profile_group_start": max(
+            0, parse_int(task_context.get("profile_group_start"), 0)
+        ),
+        "profile_group_end": max(
+            0, parse_int(task_context.get("profile_group_end"), 0)
+        ),
+        "task_mode": str(task_context.get("task_mode", "normal") or "normal"),
+        "complete_role_index": get_agent_complete_role_index(agent_profile),
+        "assist": {
+            "active": bool(assist.get("active", False)),
+            "role": str(assist.get("role", "") or ""),
+            "assist_state": str(assist.get("assist_state", "") or ""),
+            "target_agent_id": str(assist.get("target_agent_id", "") or ""),
+            "helper_agent_id": str(assist.get("helper_agent_id", "") or ""),
+            "helper_agent_ids": [str(item or "") for item in helper_agent_ids],
+            "delegate_start": max(0, parse_int(assist.get("delegate_start"), 0)),
+            "delegate_end": max(0, parse_int(assist.get("delegate_end"), 0)),
+            "effective_target_group_end": max(
+                0,
+                parse_int(assist.get("effective_target_group_end"), 0),
+            ),
+            "planned_effective_target_group_end": max(
+                0,
+                parse_int(assist.get("planned_effective_target_group_end"), 0),
+            ),
+        },
+    }
+    return json.dumps(payload, ensure_ascii=False, sort_keys=True)
+
+
+def clear_completed_latch(agent_id: str) -> None:
+    if not agent_id:
+        return
+    completed_latches.pop(agent_id, None)
+
+
+def get_active_completed_latch(
+    agent_profile: Optional[Dict[str, Any]],
+    report_item: Optional[Dict[str, Any]],
+    heartbeat_item: Optional[Dict[str, Any]] = None,
+) -> Optional[Dict[str, Any]]:
+    agent_id = str(
+        (report_item or {}).get("agent_id")
+        or (agent_profile or {}).get("agent_id")
+        or ""
+    ).strip()
+    if not agent_id:
+        return None
+
+    with state_lock:
+        latch = dict(completed_latches.get(agent_id, {}))
+    if not latch:
+        return None
+
+    if str(latch.get("work_date", "") or "") != today_str():
+        with state_lock:
+            clear_completed_latch(agent_id)
+            completed_state.pop(agent_id, None)
+            completed_notice_sent.pop(agent_id, None)
+        return None
+
+    intent = str((heartbeat_item or {}).get("intent", "") or "").strip().lower()
+    if intent in COMPLETION_LATCH_RELEASE_INTENTS:
+        with state_lock:
+            clear_completed_latch(agent_id)
+            completed_state.pop(agent_id, None)
+            completed_notice_sent.pop(agent_id, None)
+        return None
+
+    current_fingerprint = build_completion_task_fingerprint(agent_profile)
+    if current_fingerprint != str(latch.get("task_fingerprint", "") or ""):
+        with state_lock:
+            clear_completed_latch(agent_id)
+            completed_state.pop(agent_id, None)
+            completed_notice_sent.pop(agent_id, None)
+        return None
+
+    return latch
+
+
+def maybe_release_completed_latch_for_report(
+    agent_profile: Optional[Dict[str, Any]],
+    report: Dict[str, Any],
+) -> None:
+    agent_id = str(report.get("agent_id", "") or "").strip()
+    if not agent_id:
+        return
+    latch = get_active_completed_latch(agent_profile, report)
+    if not latch:
+        return
+    if build_report_progress_signature(report) == str(
+        latch.get("report_signature", "") or ""
+    ):
+        return
+    with state_lock:
+        clear_completed_latch(agent_id)
+        completed_state.pop(agent_id, None)
+        completed_notice_sent.pop(agent_id, None)
+
+
+def remember_completed_latch(
+    agent_profile: Optional[Dict[str, Any]],
+    report: Dict[str, Any],
+    completion_state: Dict[str, Any],
+) -> None:
+    agent_id = str(report.get("agent_id", "") or "").strip()
+    if not agent_id:
+        return
+    latch = {
+        "work_date": today_str(),
+        "task_fingerprint": build_completion_task_fingerprint(agent_profile),
+        "report_signature": build_report_progress_signature(report),
+        "target_group_end": max(
+            0,
+            parse_int(
+                completion_state.get("target_group_end"),
+                parse_int(report.get("current_group"), 0),
+            ),
+        ),
+        "complete_role_index": max(
+            0,
+            parse_int(
+                completion_state.get("complete_role_index"),
+                parse_int(report.get("role_index"), 0),
+            ),
+        ),
+        "completion_basis": str(completion_state.get("completion_basis", "") or ""),
+        "server_time": str(report.get("server_time", "") or ""),
+        "current_group": max(0, parse_int(report.get("current_group"), 0)),
+        "finished_group": max(0, parse_int(report.get("finished_group"), 0)),
+        "next_group": max(0, parse_int(report.get("next_group"), 0)),
+        "role_index": max(0, parse_int(report.get("role_index"), 0)),
+        "region": str(report.get("region", "") or ""),
+        "event": str(report.get("event", "") or ""),
+    }
+    with state_lock:
+        completed_latches[agent_id] = latch
+
+
 def get_completion_state(
     agent_profile: Optional[Dict[str, Any]],
     report_item: Optional[Dict[str, Any]],
+    heartbeat_item: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     task_context = build_agent_task_context(agent_profile)
     group_end = max(0, parse_int(task_context.get("group_end"), 0))
     complete_role_index = get_agent_complete_role_index(agent_profile)
+    completed_latch = get_active_completed_latch(
+        agent_profile,
+        report_item,
+        heartbeat_item,
+    )
+    if completed_latch:
+        return {
+            "completed": True,
+            "target_group_end": max(
+                0,
+                parse_int(completed_latch.get("target_group_end"), group_end),
+            ),
+            "complete_role_index": max(
+                0,
+                parse_int(
+                    completed_latch.get("complete_role_index"),
+                    complete_role_index,
+                ),
+            ),
+            "completion_basis": str(
+                completed_latch.get("completion_basis", "latched_completion") or ""
+            )
+            or "latched_completion",
+        }
     if not report_item:
         return {
             "completed": False,
@@ -937,6 +1132,7 @@ def ensure_runtime_state_for_today() -> None:
         stale_state.clear()
         completed_state.clear()
         completed_notice_sent.clear()
+        completed_latches.clear()
         last_alert_sent_at.clear()
         alert_stale_started_at.clear()
         alert_sent_count.clear()
@@ -980,13 +1176,25 @@ def build_agent_runtime_snapshot_from_state(
             "assist": task_context.get("assist", build_assist_view(None)),
         }
 
-    completion_state = get_completion_state(agent_profile, report_item)
+    completion_state = get_completion_state(
+        agent_profile,
+        report_item,
+        heartbeat_item,
+    )
     elapsed = int(max(0, current_ts - float(report_item.get("server_epoch", 0))))
     result_stale = False if completion_state["completed"] else elapsed > settings.alert_timeout_seconds
+    result_snapshot = build_result_snapshot(agent_profile, report_item, now_ts=current_ts)
+    heartbeat_snapshot = build_heartbeat_snapshot(heartbeat_item, now_ts=current_ts)
     supervision_snapshot = build_supervision_snapshot(
         agent_profile,
         heartbeat_item or None,
         now_ts=current_ts,
+    )
+    supervision_snapshot = reconcile_supervision_snapshot(
+        agent_profile,
+        supervision_snapshot,
+        result_snapshot,
+        heartbeat_snapshot,
     )
     actionable_stale = should_alert_for_result_stale(
         result_stale,
@@ -3398,6 +3606,8 @@ async def maybe_send_completed_notice(agent_id: str, report: Dict[str, Any]) -> 
     if not row["completed"]:
         return
 
+    remember_completed_latch(agent_profile, report, completion_state)
+
     if not completed_notice_sent.get(agent_id, False):
         ok = await post_wecom_markdown(build_completed_markdown(row))
         if ok:
@@ -4280,6 +4490,11 @@ async def api_agent_heartbeat(
         "server_time": server_time,
         "server_epoch": server_epoch,
     }
+    if heartbeat["intent"] in COMPLETION_LATCH_RELEASE_INTENTS:
+        with state_lock:
+            clear_completed_latch(payload.agent_id)
+            completed_state.pop(payload.agent_id, None)
+            completed_notice_sent.pop(payload.agent_id, None)
     with state_lock:
         heartbeat_states[payload.agent_id] = heartbeat
         report_item = dict(agent_states.get(payload.agent_id, {}))
@@ -4352,6 +4567,9 @@ async def api_report(
         "server_time": server_time,
         "server_epoch": server_epoch,
     }
+
+    agent_profile = get_agent_profile(payload.agent_id)
+    maybe_release_completed_latch_for_report(agent_profile, report)
 
     with state_lock:
         agent_states[payload.agent_id] = report
@@ -4439,6 +4657,7 @@ async def api_agent_recovering(
         stale_state[payload.agent_id] = False
         completed_state[payload.agent_id] = False
         completed_notice_sent.pop(payload.agent_id, None)
+        clear_completed_latch(payload.agent_id)
         last_alert_sent_at.pop(payload.agent_id, None)
         alert_stale_started_at.pop(payload.agent_id, None)
         alert_sent_count.pop(payload.agent_id, None)
@@ -4492,6 +4711,7 @@ async def api_agent_remove(
         stale_state.pop(payload.agent_id, None)
         completed_state.pop(payload.agent_id, None)
         completed_notice_sent.pop(payload.agent_id, None)
+        clear_completed_latch(payload.agent_id)
         last_alert_sent_at.pop(payload.agent_id, None)
         alert_stale_started_at.pop(payload.agent_id, None)
         alert_sent_count.pop(payload.agent_id, None)
@@ -4516,6 +4736,7 @@ async def api_agents_clear(
         stale_state.clear()
         completed_state.clear()
         completed_notice_sent.clear()
+        completed_latches.clear()
         last_alert_sent_at.clear()
         alert_stale_started_at.clear()
         alert_sent_count.clear()
