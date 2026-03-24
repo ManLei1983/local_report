@@ -301,6 +301,18 @@ tr.active td{background:#f5f9ff}
               <label>每日最大重启次数<input type="number" name="max_restart_per_day" value="{{ selected_agent.max_restart_per_day }}" min="0"></label>
               <label>备注<input type="text" name="notes" value="{{ selected_agent.notes }}"></label>
             </div>
+            <div class="two">
+              <label>EXE 版本<input type="text" name="exe_version" value="{{ selected_agent.exe_version }}" placeholder="例如 2026-03-23.1"></label>
+              <label>启动文件名<input type="text" name="startup_exe" value="{{ selected_agent.startup_exe }}" placeholder="例如 QianNian3.21.1.exe"></label>
+            </div>
+            <div class="two">
+              <label>EXE 共享路径<input type="text" name="exe_url" value="{{ selected_agent.exe_url }}" placeholder="例如 \\192.168.1.50\qiannian_release\2026-03-23.1\QianNian3.21.1.exe"></label>
+              <label>EXE SHA256<input type="text" name="exe_sha256" value="{{ selected_agent.exe_sha256 }}"></label>
+            </div>
+            <div class="two">
+              <label>资源清单版本<input type="text" name="resource_manifest_version" value="{{ selected_agent.resource_manifest_version }}" placeholder="例如 2026-03-23.1"></label>
+              <label>启动参数<input type="text" name="startup_args" value="{{ selected_agent.startup_args }}" placeholder="可留空"></label>
+            </div>
           </div>
 
           <div class="card" style="margin:16px 0 0;padding:14px;box-shadow:none">

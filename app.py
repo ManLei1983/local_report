@@ -465,6 +465,17 @@ def init_db() -> None:
         db_conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_resource_items_kind ON resource_items(kind)"
         )
+        ensure_table_columns(
+            "resource_items",
+            {
+                "ini_section": "TEXT DEFAULT ''",
+                "ini_key": "TEXT DEFAULT ''",
+                "ini_value": "TEXT DEFAULT ''",
+                "text_key": "TEXT DEFAULT ''",
+                "text_line": "TEXT DEFAULT ''",
+                "append_comment": "TEXT DEFAULT ''",
+            },
+        )
 
     if (not settings.persist_reports) and settings.delete_db_on_startup:
         with db_lock:
@@ -782,7 +793,9 @@ def resolve_download_url(request: Request, raw_url: str) -> str:
     raw_url = (raw_url or "").strip()
     if not raw_url:
         return ""
-    if raw_url.startswith(("http://", "https://")):
+    if raw_url.startswith(("http://", "https://", "file://", "\\\\")):
+        return raw_url
+    if re.match(r"^[A-Za-z]:[\\/]", raw_url):
         return raw_url
     return str(request.base_url).rstrip("/") + "/" + raw_url.lstrip("/")
 
@@ -2003,6 +2016,12 @@ def blank_resource_item() -> Dict[str, Any]:
         "target_path": "",
         "url": "",
         "sha256": "",
+        "ini_section": "",
+        "ini_key": "",
+        "ini_value": "",
+        "text_key": "",
+        "text_line": "",
+        "append_comment": "",
         "size_bytes": 0,
         "target_agents": "",
         "notes": "",
@@ -2092,6 +2111,12 @@ def row_to_resource_item(row: sqlite3.Row) -> Dict[str, Any]:
         "target_path": row["target_path"] or "",
         "url": row["url"] or "",
         "sha256": row["sha256"] or "",
+        "ini_section": row["ini_section"] if "ini_section" in row.keys() else "",
+        "ini_key": row["ini_key"] if "ini_key" in row.keys() else "",
+        "ini_value": row["ini_value"] if "ini_value" in row.keys() else "",
+        "text_key": row["text_key"] if "text_key" in row.keys() else "",
+        "text_line": row["text_line"] if "text_line" in row.keys() else "",
+        "append_comment": row["append_comment"] if "append_comment" in row.keys() else "",
         "size_bytes": row["size_bytes"],
         "target_agents": row["target_agents"] or "",
         "notes": row["notes"] or "",
@@ -3222,7 +3247,9 @@ def list_resource_items(
         return []
     query = """
         SELECT id, name, enabled, kind, version, target_path, url, sha256,
-               size_bytes, target_agents, notes, updated_at, updated_epoch
+               ini_section, ini_key, ini_value, text_key, text_line,
+               append_comment, size_bytes, target_agents, notes,
+               updated_at, updated_epoch
         FROM resource_items
     """
     params: List[Any] = []
@@ -3246,7 +3273,9 @@ def get_resource_item(resource_id: int) -> Optional[Dict[str, Any]]:
         row = db_conn.execute(
             """
             SELECT id, name, enabled, kind, version, target_path, url, sha256,
-                   size_bytes, target_agents, notes, updated_at, updated_epoch
+                   ini_section, ini_key, ini_value, text_key, text_line,
+                   append_comment, size_bytes, target_agents, notes,
+                   updated_at, updated_epoch
             FROM resource_items
             WHERE id = ?
             """,
@@ -3268,8 +3297,10 @@ def upsert_resource_item(item: Dict[str, Any]) -> int:
                 """
                 INSERT INTO resource_items (
                     id, name, enabled, kind, version, target_path, url, sha256,
-                    size_bytes, target_agents, notes, updated_at, updated_epoch
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ini_section, ini_key, ini_value, text_key, text_line,
+                    append_comment, size_bytes, target_agents, notes,
+                    updated_at, updated_epoch
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(name) DO UPDATE SET
                     enabled=excluded.enabled,
                     kind=excluded.kind,
@@ -3277,6 +3308,12 @@ def upsert_resource_item(item: Dict[str, Any]) -> int:
                     target_path=excluded.target_path,
                     url=excluded.url,
                     sha256=excluded.sha256,
+                    ini_section=excluded.ini_section,
+                    ini_key=excluded.ini_key,
+                    ini_value=excluded.ini_value,
+                    text_key=excluded.text_key,
+                    text_line=excluded.text_line,
+                    append_comment=excluded.append_comment,
                     size_bytes=excluded.size_bytes,
                     target_agents=excluded.target_agents,
                     notes=excluded.notes,
@@ -3292,6 +3329,12 @@ def upsert_resource_item(item: Dict[str, Any]) -> int:
                     item["target_path"],
                     item["url"],
                     item["sha256"],
+                    item.get("ini_section", ""),
+                    item.get("ini_key", ""),
+                    item.get("ini_value", ""),
+                    item.get("text_key", ""),
+                    item.get("text_line", ""),
+                    item.get("append_comment", ""),
                     item["size_bytes"],
                     item["target_agents"],
                     item["notes"],
@@ -3332,6 +3375,12 @@ def build_manifest_items(
                 "target_path": item["target_path"],
                 "url": resolve_download_url(request, item["url"]),
                 "sha256": item["sha256"],
+                "ini_section": item.get("ini_section", ""),
+                "ini_key": item.get("ini_key", ""),
+                "ini_value": item.get("ini_value", ""),
+                "text_key": item.get("text_key", ""),
+                "text_line": item.get("text_line", ""),
+                "append_comment": item.get("append_comment", ""),
                 "size_bytes": item["size_bytes"],
                 "target_agents": split_csv_text(item["target_agents"]),
                 "notes": item["notes"],
@@ -4294,6 +4343,12 @@ async def console_resource_save(
         "target_path": str(form.get("target_path", "")).strip(),
         "url": str(form.get("url", "")).strip(),
         "sha256": str(form.get("sha256", "")).strip(),
+        "ini_section": str(form.get("ini_section", "")).strip(),
+        "ini_key": str(form.get("ini_key", "")).strip(),
+        "ini_value": str(form.get("ini_value", "")).strip(),
+        "text_key": str(form.get("text_key", "")).strip(),
+        "text_line": str(form.get("text_line", "")).strip(),
+        "append_comment": str(form.get("append_comment", "")).strip(),
         "size_bytes": parse_int(form.get("size_bytes"), 0),
         "target_agents": str(form.get("target_agents", "")).strip(),
         "notes": str(form.get("notes", "")).strip(),

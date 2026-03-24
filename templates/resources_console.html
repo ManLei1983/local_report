@@ -63,7 +63,7 @@ tr.active td{background:#f3fcf8}
             <div><div style="color:#5a6b7f;font-size:13px;margin-bottom:6px">是否启用</div><label class="inline-check"><input type="checkbox" name="enabled" {% if selected_resource.enabled %}checked{% endif %}>启用该资源</label></div>
           </div>
           <div class="two">
-            <label>资源类型<select name="kind"><option value="config" {% if selected_resource.kind == 'config' %}selected{% endif %}>config</option><option value="text" {% if selected_resource.kind == 'text' %}selected{% endif %}>text</option><option value="zip" {% if selected_resource.kind == 'zip' %}selected{% endif %}>zip</option><option value="exe" {% if selected_resource.kind == 'exe' %}selected{% endif %}>exe</option></select></label>
+            <label>资源类型<select name="kind"><option value="config" {% if selected_resource.kind == 'config' %}selected{% endif %}>config</option><option value="text" {% if selected_resource.kind == 'text' %}selected{% endif %}>text</option><option value="zip" {% if selected_resource.kind == 'zip' %}selected{% endif %}>zip</option><option value="exe" {% if selected_resource.kind == 'exe' %}selected{% endif %}>exe</option><option value="zip_bundle" {% if selected_resource.kind == 'zip_bundle' %}selected{% endif %}>zip_bundle</option><option value="ini_value" {% if selected_resource.kind == 'ini_value' %}selected{% endif %}>ini_value</option><option value="text_kv_line" {% if selected_resource.kind == 'text_kv_line' %}selected{% endif %}>text_kv_line</option></select></label>
             <label>版本<input type="text" name="version" value="{{ selected_resource.version }}"></label>
           </div>
           <div class="two">
@@ -73,6 +73,18 @@ tr.active td{background:#f3fcf8}
           <div class="two">
             <label>下载地址<input type="text" name="url" value="{{ selected_resource.url }}"></label>
             <label>SHA256<input type="text" name="sha256" value="{{ selected_resource.sha256 }}"></label>
+          </div>
+          <div class="two">
+            <label>INI 节(section)<input type="text" name="ini_section" value="{{ selected_resource.ini_section }}" placeholder="例如 Hedge_Coord"></label>
+            <label>INI 键(key)<input type="text" name="ini_key" value="{{ selected_resource.ini_key }}" placeholder="例如 coord"></label>
+          </div>
+          <div class="two">
+            <label>INI 值(value)<input type="text" name="ini_value" value="{{ selected_resource.ini_value }}" placeholder="例如 500,500"></label>
+            <label>文本匹配键<input type="text" name="text_key" value="{{ selected_resource.text_key }}" placeholder="例如 Call_Send_Login"></label>
+          </div>
+          <div class="two">
+            <label>文本整行内容<input type="text" name="text_line" value="{{ selected_resource.text_line }}" placeholder="例如 Call_Send_Login=AAAAAAAA,1F"></label>
+            <label>追加注释<input type="text" name="append_comment" value="{{ selected_resource.append_comment }}" placeholder="例如 3月22号 更新"></label>
           </div>
           <div class="two">
             <label>大小 bytes<input type="number" name="size_bytes" value="{{ selected_resource.size_bytes }}" min="0"></label>
